@@ -2678,14 +2678,16 @@ describe("ChatGPT outer-native harness v4", () => {
   });
 
   test.each([
-    { bigger: true, pro: false, outputLimit: 2_500 },
-    { bigger: true, pro: true, outputLimit: 50_000 },
-    { bigger: false, pro: false, outputLimit: 50_000 },
-  ])("uses the delivered shell output limit to forecast continuation %j", async ({ bigger, pro, outputLimit }) => {
+    { bigger: true, pro: false, tool: "exec_command", requested: 50_000, outputLimit: 2_500 },
+    { bigger: true, pro: false, tool: "write_stdin", requested: undefined, outputLimit: 2_500 },
+    { bigger: true, pro: false, tool: "write_stdin", requested: 500, outputLimit: 500 },
+    { bigger: true, pro: true, tool: "exec_command", requested: 50_000, outputLimit: 50_000 },
+    { bigger: false, pro: false, tool: "exec_command", requested: 50_000, outputLimit: 50_000 },
+  ])("uses the delivered shell output limit to forecast continuation %j", async ({ bigger, pro, tool, requested, outputLimit }) => {
     const socketPath = brokerTestEndpoint(`cgw-shell-budget-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
-      baseUrl: `browser://shell-budget-${bigger}-${pro}`,
+      baseUrl: `browser://shell-budget-${bigger}-${pro}-${tool}-${requested}`,
       chatgptWeb: {
         brokerSocketPath: socketPath, turnTimeoutMs: 15_000, localToolsEnabled: true,
         solAvailable: true, proAvailable: pro, experimentalBiggerContext: bigger,
@@ -2693,7 +2695,8 @@ describe("ChatGPT outer-native harness v4", () => {
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run;
-    const command = { cmd: "read-next-section", workdir: tempRoot, max_output_tokens: 50_000 };
+    const args = tool === "exec_command" ? { cmd: "read-next-section", workdir: tempRoot } : { session_id: 12, chars: "" };
+    const requestedArgs = { ...args, max_output_tokens: requested };
     let receivedResult: BrokerToolResult | undefined;
     worker.run = async turn => {
       const prepared = await turn.prepare();
@@ -2702,7 +2705,7 @@ describe("ChatGPT outer-native harness v4", () => {
           method: "claim", token: prepared.turnToken!,
         });
         receivedResult = await invokeAfterBrowserBoundary(turn, () => callTurnBroker<BrokerToolResult>(socketPath, {
-          method: "invoke", bindingId, wireName: "exec_command", freeform: false, arguments: command,
+          method: "invoke", bindingId, wireName: tool, freeform: false, arguments: requestedArgs,
         }, 15_000));
         turn.onTextDelta("Read complete.");
         return "Read complete.";
@@ -2723,26 +2726,33 @@ describe("ChatGPT outer-native harness v4", () => {
       const call = events.find(event => event.type === "tool_call_start");
       const delta = events.find(event => event.type === "tool_call_delta");
       const done = events.find(event => event.type === "done");
-      expect(call?.name).toBe("exec_command");
-      expect(JSON.parse(delta!.arguments)).toEqual({ ...command, max_output_tokens: outputLimit });
+      if (!call || !delta || !done?.usage) throw new Error("Expected a complete tool round");
+      expect(call.name).toBe(tool);
+      expect(JSON.parse(delta.arguments)).toEqual({ ...args, max_output_tokens: outputLimit });
       if (bigger && !pro) {
-        expect(done!.usage!.inputTokens).toBeGreaterThan(90_000);
-        expect(done!.usage!.inputTokens).toBeLessThan(100_000);
+        expect(done.usage.inputTokens).toBeGreaterThan(90_000);
+        expect(done.usage.inputTokens).toBeLessThan(100_000);
+      }
+      if (bigger && !pro && tool === "exec_command") {
+        const replay: AdapterEvent[] = [];
+        await adapter.runTurn!(structuredClone(request), { headers: new Headers() }, event => replay.push(event));
+        expect(replay.filter(event => event.type === "tool_call_start" || event.type === "tool_call_delta"))
+          .toEqual([call, delta]);
       }
 
       const continuation = structuredClone(request);
-      const argumentsSent = JSON.parse(delta!.arguments);
+      const argumentsSent = JSON.parse(delta.arguments);
       const output = JSON.stringify({ output: "section evidence", exit_code: 0 });
       continuation.context.messages.push({
         role: "assistant", timestamp: 20,
-        content: [{ type: "toolCall", id: call!.id, name: "exec_command", arguments: argumentsSent }],
+        content: [{ type: "toolCall", id: call.id, name: tool, arguments: argumentsSent }],
       }, {
-        role: "toolResult", toolCallId: call!.id, toolName: "exec_command", content: output,
+        role: "toolResult", toolCallId: call.id, toolName: tool, content: output,
         isError: false, timestamp: 21,
       });
       (continuation._rawBody as { input: unknown[] }).input.push(
-        { type: "function_call", call_id: call!.id, name: "exec_command", arguments: delta!.arguments },
-        { type: "function_call_output", call_id: call!.id, output },
+        { type: "function_call", call_id: call.id, name: tool, arguments: delta.arguments },
+        { type: "function_call_output", call_id: call.id, output },
       );
       const final: AdapterEvent[] = [];
       await adapter.runTurn!(continuation, { headers: new Headers() }, event => final.push(event));
