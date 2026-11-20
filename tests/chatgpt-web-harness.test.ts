@@ -2677,6 +2677,83 @@ describe("ChatGPT outer-native harness v4", () => {
     await broker.close();
   });
 
+  test.each([
+    { bigger: true, pro: false, outputLimit: 2_500 },
+    { bigger: true, pro: true, outputLimit: 50_000 },
+    { bigger: false, pro: false, outputLimit: 50_000 },
+  ])("uses the delivered shell output limit to forecast continuation %j", async ({ bigger, pro, outputLimit }) => {
+    const socketPath = brokerTestEndpoint(`cgw-shell-budget-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://shell-budget-${bigger}-${pro}`,
+      chatgptWeb: {
+        brokerSocketPath: socketPath, turnTimeoutMs: 15_000, localToolsEnabled: true,
+        solAvailable: true, proAvailable: pro, experimentalBiggerContext: bigger,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run;
+    const command = { cmd: "read-next-section", workdir: tempRoot, max_output_tokens: 50_000 };
+    let receivedResult: BrokerToolResult | undefined;
+    worker.run = async turn => {
+      const prepared = await turn.prepare();
+      try {
+        const { bindingId } = await callTurnBroker<{ bindingId: string }>(socketPath, {
+          method: "claim", token: prepared.turnToken!,
+        });
+        receivedResult = await invokeAfterBrowserBoundary(turn, () => callTurnBroker<BrokerToolResult>(socketPath, {
+          method: "invoke", bindingId, wireName: "exec_command", freeform: false, arguments: command,
+        }, 15_000));
+        turn.onTextDelta("Read complete.");
+        return "Read complete.";
+      } finally {
+        prepared.release();
+      }
+    };
+    try {
+      const adapter = createChatGptWebAdapter(provider);
+      const request = rawWireRequest(environmentXml);
+      if (bigger && !pro) {
+        request.context.messages.unshift(...Array.from({ length: 12 }, (_, timestamp) => ({
+          role: "user" as const, timestamp, content: "const value = objects[0]?.name ?? '#test';\n".repeat(500),
+        })));
+      }
+      const events: AdapterEvent[] = [];
+      await adapter.runTurn!(request, { headers: new Headers() }, event => events.push(event));
+      const call = events.find(event => event.type === "tool_call_start");
+      const delta = events.find(event => event.type === "tool_call_delta");
+      const done = events.find(event => event.type === "done");
+      expect(call?.name).toBe("exec_command");
+      expect(JSON.parse(delta!.arguments)).toEqual({ ...command, max_output_tokens: outputLimit });
+      if (bigger && !pro) {
+        expect(done!.usage!.inputTokens).toBeGreaterThan(90_000);
+        expect(done!.usage!.inputTokens).toBeLessThan(100_000);
+      }
+
+      const continuation = structuredClone(request);
+      const argumentsSent = JSON.parse(delta!.arguments);
+      const output = JSON.stringify({ output: "section evidence", exit_code: 0 });
+      continuation.context.messages.push({
+        role: "assistant", timestamp: 20,
+        content: [{ type: "toolCall", id: call!.id, name: "exec_command", arguments: argumentsSent }],
+      }, {
+        role: "toolResult", toolCallId: call!.id, toolName: "exec_command", content: output,
+        isError: false, timestamp: 21,
+      });
+      (continuation._rawBody as { input: unknown[] }).input.push(
+        { type: "function_call", call_id: call!.id, name: "exec_command", arguments: delta!.arguments },
+        { type: "function_call_output", call_id: call!.id, output },
+      );
+      const final: AdapterEvent[] = [];
+      await adapter.runTurn!(continuation, { headers: new Headers() }, event => final.push(event));
+      expect(receivedResult?.structuredContent).toEqual({ output: "section evidence", exit_code: 0 });
+      expect(final.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+    } finally {
+      worker.run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  }, 25_000);
+
   test("recalculates usage from tool results added during the active browser turn", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h3-usage-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {

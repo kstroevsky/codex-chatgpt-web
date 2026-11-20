@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { resolve } from "node:path";
-import { isChatGptWebZeroRiskBackendModel, supportsChatGptWebBiggerContext } from "../../chatgpt-web-models";
+import { isChatGptWebZeroRiskBackendModel, supportsChatGptWebBiggerContext, supportsChatGptWebBiggerInlineInput } from "../../chatgpt-web-models";
 import { ChatGptMessageLimitStore, runWithMessageLimitRecovery } from "./message-limit-recovery";
 import { defaultBrokerEndpoint, expandUserPath, resolveBrokerEndpoint } from "../../config";
 import {
@@ -30,7 +30,7 @@ import { createChatGptStructuredOutputValidator } from "./output-validation";
 import { chatGptWebTurnRetryPolicy } from "./retry-policy";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult, type TurnBrokerOwner } from "./turn-broker";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
-import { compileBiggerContextPrompt, compileFreshChatGptWebPrompt, estimateChatGptWebUsage } from "./usage";
+import { compileBiggerContextPrompt, compileFreshChatGptWebPrompt, estimateChatGptWebUsage, limitChatGptWebShellOutput } from "./usage";
 import { ChatGptThreadEnvironmentStore } from "./thread-environment";
 import {
   ChatGptLunaCheckpointStore,
@@ -1550,10 +1550,15 @@ export function createChatGptWebAdapter(
                   return;
                 }
                 validateBatchTools(parsed, next.requests);
-                session.setOutstanding(next.requests, roundReasoning, session.roundEvents(roundKey));
+                // Keep the delivered arguments, retry journal and usage forecast on the same budget.
+                const boundShellOutput = experimentalBiggerContext && !session.runtime.manualControl
+                  && supportsChatGptWebBiggerInlineInput(parsed.modelId,
+                    resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities).effort, turnCapabilities);
+                const requests = boundShellOutput ? next.requests.map(limitChatGptWebShellOutput) : next.requests;
+                session.setOutstanding(requests, roundReasoning, session.roundEvents(roundKey));
                 emitRoundBatch(buffer => emitToolBatch(
-                  next.requests,
-                  estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning: roundReasoning, toolRequests: next.requests }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments, provider.chatgptWeb?.appName, usageLimits(parsed, turnCapabilities)),
+                  requests,
+                  estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning: roundReasoning, toolRequests: requests }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments, provider.chatgptWeb?.appName, usageLimits(parsed, turnCapabilities)),
                   buffer,
                 ));
                 session.completeRound(roundKey);

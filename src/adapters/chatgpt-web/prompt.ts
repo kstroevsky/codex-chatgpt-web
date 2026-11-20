@@ -12,6 +12,7 @@ import {
   resolveChatGptWebTransportLimits,
   supportsChatGptWebBiggerContext,
   supportsChatGptWebBiggerInlineInput,
+  CHATGPT_WEB_PLUS_THINKING_SHELL_OUTPUT_TOKENS,
 } from "../../chatgpt-web-models";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import type { ChatGptMessageLimits } from "./message-limit-recovery";
@@ -718,6 +719,10 @@ export function compileChatGptWebPrompt(
     : mode.localTools
     ? [
       "For local work required by the task, use the selected plugin's tools directly according to their declared descriptions and schemas.",
+      ...(options?.experimentalBiggerContext && supportsChatGptWebBiggerInlineInput(parsed.modelId, mode.effort, capabilities) ? [
+        `Shell and terminal poll results are capped at ${CHATGPT_WEB_PLUS_THINKING_SHELL_OUTPUT_TOKENS} tokens per call. Search for the relevant files or sections first, then read targeted line ranges. If you need a complete build or test log, save it to a local scratch file and inspect the relevant lines separately.`,
+        "When reading another Codex chat, request the smallest relevant page and include tool outputs only when the evidence requires them.",
+      ] : []),
       "These tools are connected by the user to their Codex runtime; local actions execute on that runtime's device under its configured sandbox and approval rules. Assess each action by its actual effects and the user's authorization; an authenticated connection does not make every action low risk.",
       "Call a local Codex tool only when the latest active request requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer the request directly without a tool call.",
       "Use actual results from the selected plugin as evidence for local observations and effects.",
