@@ -168,6 +168,26 @@ test("owned HTTP 200 SSE confirms size rejection eagerly before the stream abort
   await fixture.observer.dispose();
 });
 
+test("stall detection observes owned model frames and ignores stream keepalives and completed streams", async () => {
+  const fixture = await serviceStreamFixture(() => {});
+  fixture.observer.begin();
+  fixture.request("owned");
+  fixture.response("owned");
+  await new Promise(resolve => setImmediate(resolve));
+  const opened = fixture.observer.openStreamLastActivity()!;
+  expect(opened).toBeGreaterThan(0);
+  await Bun.sleep(5);
+  fixture.data("owned", ": ping\n\n" + frame({ type: "heartbeat", v: { timestamp: 123 } }));
+  expect(fixture.observer.openStreamLastActivity()).toBe(opened);
+  fixture.data("owned", frame({ message: message() }));
+  expect(fixture.observer.openStreamLastActivity()).toBeGreaterThan(opened);
+  fixture.data("owned", "data: [DONE]\n\n");
+  expect(fixture.observer.openStreamLastActivity()).toBeUndefined();
+  fixture.observer.begin();
+  expect(fixture.observer.openStreamLastActivity()).toBeUndefined();
+  await fixture.observer.dispose();
+});
+
 test("an aborted stream confirms a size rejection from its initially buffered bytes", async () => {
   let rejected = 0;
   const buffered = Promise.withResolvers<string>();

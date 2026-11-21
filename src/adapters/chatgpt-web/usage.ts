@@ -119,8 +119,8 @@ export function compileFreshChatGptWebPrompt(
     if (!(error instanceof ChatGptWebAdapterError)
       || (error.code !== "context_length_exceeded" && error.code !== "chatgpt_message_transport_capacity_exceeded")
       || !capabilities.localToolsEnabled || parsed._compactionRequest
-      || latest?.role !== "user" || latest.origin || isNativeCompactionMessage(latest)
-      || isReadableCompactionSummaryText(latest.content)) throw error;
+      || (!options.streamStallRecovery && (latest?.role !== "user" || latest.origin || isNativeCompactionMessage(latest)
+        || isReadableCompactionSummaryText(latest.content)))) throw error;
     const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities);
     if (!supportsChatGptWebBiggerInlineInput(parsed.modelId, mode.effort, capabilities)) throw error;
     const recovered = compileBiggerContextPrompt(parsed, capabilities, turnToken, {

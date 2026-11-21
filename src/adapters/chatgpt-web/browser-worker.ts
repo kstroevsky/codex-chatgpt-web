@@ -102,6 +102,7 @@ import {
   chatGptRetainedConversationUnavailableError,
   chatGptStoppedThinkingError,
   chatGptResponseIncompleteError,
+  chatGptStreamStalledError,
   chatGptToolApprovalRequiredError,
 } from "./adapter-error";
 import {
@@ -147,6 +148,7 @@ export const CHATGPT_EMPTY_RESPONSE_GRACE_MS = 10_000;
 // Use the same bounded inactivity window as stalled MCP work; explicit errors, empty
 // completed responses and vanished DOM retain their own shorter checks.
 export const CHATGPT_COMPLETION_ACTION_GRACE_MS = 10 * 60_000;
+export const CHATGPT_OPEN_STREAM_IDLE_MS = 10 * 60_000;
 export const CHATGPT_COMPLETION_SETTLE_MS = 2_000;
 export const CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS = 60_000;
 export const MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS = 3;
@@ -1261,6 +1263,37 @@ export interface ChatGptVisibleTraceBlock {
   key?: string;
   complete?: boolean;
   uiControl?: boolean;
+}
+
+export class ChatGptOpenStreamWatchdog {
+  private visibleText?: string;
+  private trace?: readonly ChatGptVisibleTraceBlock[];
+  private visibleTrace?: string;
+  private lastVisibleActivity = 0;
+
+  stalled(
+    snapshot: { visibleText: string; traceBlocks: readonly ChatGptVisibleTraceBlock[] },
+    streamActivity: number | undefined,
+    tools: ChatGptExternalTurnProgressSnapshot,
+    now = Date.now(),
+  ): boolean {
+    if (this.visibleText !== snapshot.visibleText || this.trace !== snapshot.traceBlocks) {
+      // The DOM cache can also invalidate because controls changed. Count changes in the
+      // projected response and trace only, rather than arbitrary page mutations.
+      const visibleTrace = JSON.stringify(snapshot.traceBlocks.filter(block => !isChatGptTraceControl(block))
+        .map(block => stripChatGptTraceControlSuffix(block).text));
+      if (this.visibleText !== snapshot.visibleText || this.visibleTrace !== visibleTrace) {
+        this.lastVisibleActivity = now;
+      }
+      this.visibleText = snapshot.visibleText;
+      this.trace = snapshot.traceBlocks;
+      this.visibleTrace = visibleTrace;
+    }
+    if (tools.activeToolCalls > 0) return false;
+    if (streamActivity === undefined) return false;
+    const last = Math.max(streamActivity, this.lastVisibleActivity, tools.lastProgressAt ?? 0);
+    return now - last >= CHATGPT_OPEN_STREAM_IDLE_MS;
+  }
 }
 
 export interface ChatGptVisibleTraceEvent {
@@ -4758,7 +4791,9 @@ export class ChatGptBrowserWorker {
       terminal = error instanceof ChatGptCompactionHandoffAccepted
         ? "completed"
         : (error instanceof DOMException && error.name === "AbortError")
-        || (error instanceof ChatGptWebAdapterError && error.code === "client_cancelled")
+        // Close a proven-stalled tab before the replacement can send. The diagnostic
+        // snapshot already lives on disk and the abandoned page must stop running.
+        || (error instanceof ChatGptWebAdapterError && (error.code === "client_cancelled" || error.code === "chatgpt_stream_stalled"))
         ? "aborted"
         : "failed";
       terminalMessage = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
@@ -5385,6 +5420,7 @@ export class ChatGptBrowserWorker {
         });
       };
       const domHealthTracker = new ChatGptTurnDomHealthTracker();
+      const openStreamWatchdog = new ChatGptOpenStreamWatchdog();
       const responseDomCache: ChatGptResponseDomCache = {};
       let consecutiveObservationRebinds = 0;
       let internalObservationFaults = 0;
@@ -5624,6 +5660,13 @@ export class ChatGptBrowserWorker {
             responseStreamActive,
           });
           if (domError) throw chatGptResponseIncompleteError(domError);
+        }
+        if (!turn.compaction && externalProgressSnapshot && openStreamWatchdog.stalled(
+          snapshot, responseStreamActive ? streamDiagnostics.openStreamLastActivity() : undefined,
+          externalProgressSnapshot,
+        )) {
+          console.warn(`[chatgpt-web] open_stream_stalled ${JSON.stringify({ traceId: turn.traceId, idleMs: CHATGPT_OPEN_STREAM_IDLE_MS })}`);
+          throw chatGptStreamStalledError();
         }
         await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
        } catch (error) {
