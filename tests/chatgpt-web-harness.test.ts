@@ -24,7 +24,10 @@ import { callTurnBroker, TurnBroker, RemoteTurnBroker, type BrokerToolResult } f
 import { ChatGptExternalTurnProgress, ChatGptMirroredTurnProgress, chatGptExternalProgressIsLive, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import { CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, chatGptMcpInvocationTimeout } from "../src/adapters/chatgpt-web/mcp-server";
 import { defaultBrokerEndpoint } from "../src/config";
-import { estimateChatGptWebUsage } from "../src/adapters/chatgpt-web/usage";
+import { estimateChatGptWebRoundOutputTokens, estimateChatGptWebUsage } from "../src/adapters/chatgpt-web/usage";
+import { ChatGptMessageLimitStore } from "../src/adapters/chatgpt-web/message-limit-recovery";
+import { estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
+import { CHATGPT_WEB_PLATFORM_RESERVE_TOKENS } from "../src/chatgpt-web-models";
 import { decodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { parseRequest } from "../src/responses/parser";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig, CodexTool } from "../src/types";
@@ -284,6 +287,171 @@ function canonicalJson(value: unknown): string {
 }
 
 describe("ChatGPT outer-native harness v4", () => {
+  test("fresh resume reports the accepted excerpted history and subsequent tool results", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-fresh-usage-${process.pid}-${Date.now()}`);
+    const limitPath = join(tempRoot, "fresh-usage-limits.json");
+    const account = "e".repeat(64);
+    const transactionId = "ctx_" + "4".repeat(32);
+    const caps = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web", baseUrl: `browser://fresh-usage-${Date.now()}`,
+      chatgptWeb: {
+        ...caps, browserHost: "launcher", browserHostDescriptorPath: join(tempRoot, "fresh-usage-launcher.json"),
+        brokerSocketPath: socketPath, experimentalBiggerContext: true, messageLimitStatePath: limitPath,
+      },
+    };
+    const request = rawWireRequest(environmentXml);
+    request._chatgptModelFamily = "5.6";
+    for (let index = 0; index < 26; index++) {
+      const id = `history-${index}`;
+      request.context.messages.splice(-1, 0, {
+        role: "assistant", timestamp: index,
+        content: [{ type: "toolCall", id, name: "exec_command", arguments: { cmd: "read historical file" } }],
+      }, {
+        role: "toolResult", toolName: "exec_command", toolCallId: id, timestamp: index, isError: false,
+        content: "const value = objects[0]?.name ?? '#test';\n".repeat(285) + ` historical-${index}`,
+      });
+    }
+    const history = structuredClone(request.context.messages);
+    const limits = ChatGptMessageLimitStore.forProfile(limitPath).learn(
+      JSON.stringify([account, request.modelId, "5.6", "high", false]), { chars: 45_000, tokens: 12_000 },
+    );
+    expect(estimateChatGptWebUsage(request, {}, caps, true, false, undefined, limits).inputTokens).toBeGreaterThan(108_000);
+
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run;
+    let sentTokens = 0;
+    const result = "Current evidence fetched successfully.".repeat(20);
+    worker.run = async turn => {
+      await turn.onPreparedSelected?.(false, transactionId, account);
+      const prepared = await turn.prepare(transactionId);
+      try {
+        expect(prepared.historicalShellExcerpts).toBe(24);
+        expect(prepared.multipart?.parts).toHaveLength(6);
+        sentTokens = estimateCompiledChatGptWebInputTokens(prepared, turn.modelId, transactionId);
+        expect(sentTokens).toBeLessThan(108_000);
+        await turn.onSendActivated?.();
+        await turn.onSubmitted?.();
+        const { bindingId } = await callTurnBroker<{ bindingId: string }>(socketPath, {
+          method: "claim", token: prepared.turnToken!,
+        });
+        const delivered = await invokeAfterBrowserBoundary(turn, () => callTurnBroker<BrokerToolResult>(socketPath, {
+          method: "invoke", bindingId, wireName: "exec_command", freeform: false, arguments: { cmd: "read current file" },
+        }, 15_000));
+        expect(delivered.content).toEqual([{ type: "text", text: result }]);
+        turn.onTextDelta("Read complete.");
+        return "Read complete.";
+      } finally {
+        prepared.release();
+      }
+    };
+    try {
+      const adapter = createChatGptWebAdapter(provider);
+      const events: AdapterEvent[] = [];
+      await adapter.runTurn!(request, { headers: new Headers() }, event => events.push(event));
+      const first = events.find(event => event.type === "done")?.usage;
+      expect(first?.inputTokens).toBe(sentTokens);
+      const call = events.find(event => event.type === "tool_call_start")!;
+      const delta = events.find(event => event.type === "tool_call_delta")!;
+      expect(request.context.messages).toEqual(history);
+
+      const continuation = structuredClone(request);
+      continuation.context.messages.push({
+        role: "assistant", timestamp: 30,
+        content: [{ type: "toolCall", id: call.id, name: "exec_command", arguments: JSON.parse(delta.arguments) }],
+      }, {
+        role: "toolResult", toolCallId: call.id, toolName: "exec_command", content: result,
+        isError: false, timestamp: 31,
+      });
+      (continuation._rawBody as { input: unknown[] }).input.push(
+        { type: "function_call", call_id: call.id, name: "exec_command", arguments: delta.arguments },
+        { type: "function_call_output", call_id: call.id, output: result },
+      );
+      const final: AdapterEvent[] = [];
+      await adapter.runTurn!(continuation, { headers: new Headers() }, event => final.push(event));
+      const completed = final.find(event => event.type === "done")?.usage;
+      expect(completed?.inputTokens).toBeGreaterThan(first!.totalTokens!);
+      expect(completed?.totalTokens).toBeLessThan(108_000);
+    } finally {
+      worker.run = originalRun;
+      chatGptTurnSessions.clear();
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  }, 30_000);
+
+  test("Continue prices the accepted retained suffix instead of an oversized fresh multipart replay", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-retained-usage-${process.pid}-${Date.now()}`);
+    const limitPath = join(tempRoot, "retained-usage-limits.json");
+    const account = "d".repeat(64);
+    const tx = "ctx_" + "3".repeat(32);
+    const caps = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web", baseUrl: `browser://retained-usage-${Date.now()}`,
+      chatgptWeb: {
+        ...caps, browserHost: "launcher", browserHostDescriptorPath: join(tempRoot, "retained-usage-launcher.json"),
+        brokerSocketPath: socketPath, experimentalBiggerContext: true, messageLimitStatePath: limitPath,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run;
+    const sentTokens: number[] = [];
+    const answer = "Recorded outcome.";
+    worker.run = async turn => {
+      const reused = sentTokens.length > 0;
+      await turn.onPreparedSelected?.(reused, tx, account);
+      const prepared = await (reused ? turn.prepareResume! : turn.prepare)(tx);
+      if (reused) expect(prepared.text).not.toContain("fixtureHistory");
+      expect(prepared.multipart).toBeUndefined();
+      sentTokens.push(estimateCompiledChatGptWebInputTokens(prepared, turn.modelId, tx));
+      await turn.onSendActivated?.();
+      await turn.onSubmitted?.();
+      turn.onTextDelta(answer);
+      prepared.release();
+      return answer;
+    };
+    try {
+      const first = rawWireRequest(environmentXml);
+      first._chatgptModelFamily = "5.6";
+      first.context.messages.unshift(...Array.from({ length: 12 }, (_, timestamp) => ({
+        role: "user" as const, timestamp,
+        content: "const value = objects[0]?.name ?? '#test';\n".repeat(500) + " fixtureHistory",
+      })));
+      const second = structuredClone(first);
+      second.context.messages.push(
+        { role: "assistant", timestamp: 20, phase: "final_answer", content: [{ type: "text", text: answer }] },
+        { role: "user", timestamp: 21, content: "Continue" },
+      );
+      const secondRaw = second._rawBody as { client_metadata: Record<string, unknown>; input: unknown[] };
+      secondRaw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+        thread_id: "thread_test_123", turn_id: "turn_test_456",
+      });
+      secondRaw.input.push(
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: answer }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "Continue" }],
+          internal_chat_message_metadata_passthrough: { turn_id: "turn_test_456" } },
+      );
+      const adapter = createChatGptWebAdapter(provider);
+      await adapter.runTurn!(first, { headers: new Headers() }, () => {});
+      const limit = ChatGptMessageLimitStore.forProfile(limitPath).learn(
+        JSON.stringify([account, first.modelId, "5.6", "high", false]), { chars: 194_000, tokens: 51_000 },
+      );
+      expect(limit).toBeDefined();
+      const counterfactual = estimateChatGptWebUsage(second, { answer }, caps, true, false, undefined, limit);
+      expect(counterfactual.inputTokens).toBeGreaterThan(108_000);
+      const events: AdapterEvent[] = [];
+      await adapter.runTurn!(second, { headers: new Headers() }, event => events.push(event));
+      expect(sentTokens).toHaveLength(2);
+      const final = events.find(event => event.type === "done");
+      expect(final?.usage?.inputTokens).toBe(sentTokens[0]! + sentTokens[1]!
+        - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS + estimateChatGptWebRoundOutputTokens(first.modelId, { answer }));
+      expect(final?.usage?.inputTokens).toBeLessThan(108_000);
+    } finally {
+      worker.run = originalRun;
+      chatGptTurnSessions.clear();
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  }, 30_000);
+
   test("extracts authoritative environment, tool registry, and turn identity from the Codex wire envelope", () => {
     const request = rawWireRequest(environmentXml);
     expect(extractChatGptTurnEnvironment(request)).toEqual({

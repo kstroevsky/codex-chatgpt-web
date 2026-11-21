@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { ChatGptRetainedUsage } from "./retained-usage";
 import type { AdapterEvent, CodexParsedRequest } from "../../types";
 import type { BrokerToolRequest } from "./turn-broker";
 import { ChatGptWebAdapterError, chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
@@ -174,6 +175,7 @@ export type ChatGptTurnRuntime =
     mode: "tools";
     token: Promise<string>;
     externalProgress: ChatGptExternalTurnProgress;
+    retainedUsage?: ChatGptRetainedUsage;
   })
   | (ChatGptTurnRuntimeBase & { mode: "read-only" });
 
