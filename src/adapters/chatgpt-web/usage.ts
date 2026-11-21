@@ -157,6 +157,10 @@ function roundEvidenceText(evidence: ChatGptWebRoundEvidence): string {
   });
 }
 
+export function estimateChatGptWebRoundOutputTokens(modelId: string, evidence: ChatGptWebRoundEvidence): number {
+  return conservativeTextTokens(roundEvidenceText(evidence), modelId);
+}
+
 function pendingToolOutputTokens(evidence: ChatGptWebRoundEvidence, fallback: number): number {
   let boundedTokens = 0;
   let hasUnbounded = false;
