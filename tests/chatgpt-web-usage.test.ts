@@ -245,7 +245,7 @@ test("GPT-6 Plus keeps a fitting inline request when multipart encoding would ov
   }));
   const original = structuredClone(parsed);
   const token = "turn_" + "0".repeat(32);
-  const inline = compileChatGptWebPrompt(parsed, caps, token);
+  const inline = compileChatGptWebPrompt(parsed, caps, token, { experimentalBiggerContext: true });
   const inlineInput = estimateCompiledChatGptWebInputTokens(inline, parsed.modelId);
   expect(inlineInput).toBeGreaterThan(80_000);
   expect(inlineInput).toBeLessThan(90_000);
@@ -296,7 +296,7 @@ test("a fitting inline task below the normal checkpoint threshold retains exact 
     role: "user", timestamp: index + 1,
     content: "const value = objects[0]?.name ?? '#test';\n".repeat(500),
   }));
-  const prompt = compileChatGptWebPrompt(parsed, caps, "turn_" + "0".repeat(32));
+  const prompt = compileChatGptWebPrompt(parsed, caps, "turn_" + "0".repeat(32), { experimentalBiggerContext: true });
   expect(estimateChatGptWebUsage(parsed, { answer: "Done" }, caps, true).inputTokens)
     .toBe(estimateCompiledChatGptWebInputTokens(prompt, parsed.modelId));
 }, 15_000);
@@ -312,7 +312,7 @@ test("a retained checkpoint does not repeatedly request compaction without new t
     })),
   ] });
   parsed._chatgptModelFamily = "6";
-  const actual = estimateChatGptWebInputTokens(parsed, caps, { captureLunaCheckpoint: false });
+  const actual = estimateChatGptWebInputTokens(parsed, caps, { captureLunaCheckpoint: false }, true);
   expect(actual).toBeGreaterThan(80_000);
   expect(actual).toBeLessThan(90_000);
   expect(estimateChatGptWebUsage(parsed, { answer: "The checkpoint is still current." }, caps, true).inputTokens).toBe(actual);
@@ -321,7 +321,7 @@ test("a retained checkpoint does not repeatedly request compaction without new t
     content: "Completed a new step", isError: false, timestamp: Date.now(),
   });
   expect(estimateChatGptWebUsage(parsed, { answer: "A new step is complete." }, caps, true).inputTokens)
-    .toBe(estimateChatGptWebInputTokens(parsed, caps, { captureLunaCheckpoint: false }));
+    .toBe(estimateChatGptWebInputTokens(parsed, caps, { captureLunaCheckpoint: false }, true));
 }, 15_000);
 
 test("fitting code history retains exact usage while small bounded tool results still fit", () => {
@@ -335,7 +335,7 @@ test("fitting code history retains exact usage while small bounded tool results 
   const before = structuredClone(parsed);
   const tool = { callId: "small-read", wireName: "functions.exec_command", freeform: false,
     arguments: { cmd: "read next section", max_output_tokens: 1_000 } };
-  const actual = estimateChatGptWebInputTokens(parsed, caps, { captureLunaCheckpoint: false });
+  const actual = estimateChatGptWebInputTokens(parsed, caps, { captureLunaCheckpoint: false }, true);
   expect(actual).toBeGreaterThan(80_000);
   expect(actual).toBeLessThan(87_000);
   expect(estimateChatGptWebUsage(parsed, { toolRequests: [tool] }, caps, true).inputTokens).toBe(actual);
@@ -391,7 +391,7 @@ test("parallel unknown tools share the ordinary reserve while explicit output bu
     role: "user", timestamp: index,
     content: "const value = objects[0]?.name ?? '#test';\n".repeat(500),
   }));
-  const actual = estimateChatGptWebInputTokens(parsed, caps, { captureLunaCheckpoint: false });
+  const actual = estimateChatGptWebInputTokens(parsed, caps, { captureLunaCheckpoint: false }, true);
   expect(actual).toBeGreaterThan(90_000);
   expect(actual).toBeLessThan(110_000);
   const unknown = ["lookup_a", "lookup_b"].map(wireName => ({ callId: wireName, wireName, freeform: false }));
