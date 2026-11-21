@@ -67,3 +67,23 @@ test("a fitting fresh request preserves the complete tool result", () => {
   expect(prepared.historicalShellExcerpts).toBeUndefined();
   expect(prepared.text).toContain("Middle evidence 0");
 });
+
+test("an oversized stalled turn can carry saved results from after the latest user instruction", () => {
+  const parsed = request();
+  const instruction = parsed.context.messages.pop()!;
+  parsed.context.messages.splice(1, 0, instruction);
+  const canonical = structuredClone(parsed);
+  const savedCallIds = new Set(parsed.context.messages.flatMap(message =>
+    message.role === "toolResult" && message.toolName === "exec_command" ? [message.toolCallId] : []));
+  expect(() => compileFreshChatGptWebPrompt(parsed, caps, token, options)).toThrow("120,000-token");
+  const replacement = compileFreshChatGptWebPrompt(parsed, caps, token, {
+    ...options, streamStallRecovery: { partialAnswer: "", savedCallIds },
+  });
+  expect(replacement.historicalShellExcerpts).toBe(24);
+  const submitted = compiledChatGptWebMessages(replacement).join("\n");
+  expect(submitted).toContain("The bridge can return the saved result");
+  expect(submitted).toContain("Process status 0");
+  expect(submitted).not.toContain("Middle evidence 0");
+  expect(submitted).toContain("Middle evidence 25");
+  expect(parsed).toEqual(canonical);
+}, 30_000);

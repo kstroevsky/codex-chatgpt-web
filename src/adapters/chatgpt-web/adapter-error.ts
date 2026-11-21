@@ -43,6 +43,12 @@ export function chatGptResponseIncompleteError(message: string): ChatGptWebAdapt
   });
 }
 
+export function chatGptStreamStalledError(): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError("ChatGPT stopped streaming a response. The completed tool results are saved in this turn.", {
+    status: 504, errorType: "server_error", code: "chatgpt_stream_stalled", retryable: false,
+  });
+}
+
 export function chatGptToolApprovalRequiredError(): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(
     "ChatGPT is waiting for plugin permission. Open the plugin's settings in ChatGPT, "

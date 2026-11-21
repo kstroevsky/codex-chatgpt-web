@@ -1,4 +1,5 @@
 import { ChatGptRetainedUsage } from "./retained-usage";
+import { createStallRecovery, findStallRecoveryResult, type ChatGptStallRecovery } from "./stall-recovery";
 import { createHash, randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import { isChatGptWebZeroRiskBackendModel, supportsChatGptWebBiggerContext } from "../../chatgpt-web-models";
@@ -452,6 +453,7 @@ export function createChatGptWebAdapter(
     traceId: string,
     turnCapabilities: ChatGptWebCapabilities,
     hooks: {
+      stallRecovery?: ChatGptStallRecovery;
       onCompactionProgress?: (
         kind: "generation" | "submitted" | "multipart_acknowledged",
         part?: number,
@@ -484,7 +486,7 @@ export function createChatGptWebAdapter(
       && retainedLauncherDescriptor
       ? chatGptConversationKey(checkpointInput.parsed, executionNamespace)
       : undefined;
-    const resumeInput = conversationKey
+    const resumeInput = conversationKey && !hooks.stallRecovery
       ? retainedConversationResumeRequest(checkpointInput.parsed)
       : undefined;
     const retainConversation = conversationKey !== undefined;
@@ -540,6 +542,10 @@ export function createChatGptWebAdapter(
       const prompt = compile(input, turnCapabilities, turnToken, {
         appName: worker.appName, includeContextTokenBreakdown: true, captureLunaCheckpoint, experimentalSkillAttachments,
         experimentalBiggerContext, messageLimits, multipartTransactionId: transactionId,
+        ...(hooks.stallRecovery ? { streamStallRecovery: {
+          partialAnswer: hooks.stallRecovery.partialAnswer,
+          savedCallIds: new Set([...hooks.stallRecovery.completed.values()].map(result => result.toolCallId)),
+        } } : {}),
       });
       retainedUsage?.prepare(prompt, transactionId);
       if (prompt.historicalShellExcerpts) {
@@ -895,6 +901,7 @@ export function createChatGptWebAdapter(
       token: token.promise,
       externalProgress,
       ...(retainedUsage ? { retainedUsage } : {}),
+      ...(hooks.stallRecovery ? { stallRecovery: hooks.stallRecovery } : {}),
       browser: browserTurn.browser,
       physicalSettlement: browserTurn.physicalSettlement,
       trace,
@@ -939,6 +946,7 @@ export function createChatGptWebAdapter(
           throw error;
         }
       };
+      let acknowledgedRecoveryPrelude = 0;
       const runChatGptWebTurn = async (): Promise<void> => {
         const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
         if (manualRequest !== manualInteraction) {
@@ -1320,18 +1328,22 @@ export function createChatGptWebAdapter(
         if (abortedTurnIds?.size) {
           chatGptTurnSessions.retireAbortedOwnerTurns(ownerKey, abortedTurnIds, executionKey);
         }
-        const traceId = chatGptWebTraceId(provider, parsed);
+        const initialTrace = chatGptWebTraceId(provider, parsed);
+        const roundKey = chatGptTurnRoundKey(parsed);
         const session = await chatGptTurnSessions.getOrCreateAfterOwnerRetirement(
           executionKey,
           ownerKey,
-          () => startRuntime(parsed, environment, traceId, turnCapabilities),
-          traceId,
+          replacement => startRuntime(parsed, environment, replacement?.traceId ?? initialTrace, turnCapabilities, {
+            stallRecovery: replacement?.recovery,
+          }),
+          initialTrace,
           incoming.abortSignal,
           nativeTurnId,
           nativeIdentity.threadId,
           chatGptInstructionLineage(parsed),
+          roundKey,
         );
-        const roundKey = chatGptTurnRoundKey(parsed);
+        const traceId = session.traceId ?? initialTrace;
         const retainedUsage = session.runtime.mode === "tools" ? session.runtime.retainedUsage : undefined;
         const roundUsage = (evidence: ChatGptWebRoundEvidence) => {
           const actual = retainedUsage?.recordRound(
@@ -1368,7 +1380,8 @@ export function createChatGptWebAdapter(
         try {
           await session.runExclusive(async () => {
             const replay = session.roundEvents(roundKey);
-            replayEvents(replay, emit);
+            replayEvents(replay.slice(acknowledgedRecoveryPrelude), emit);
+            acknowledgedRecoveryPrelude = 0;
             if (session.roundCompleted(roundKey)) {
               const failure = session.roundFailure(roundKey);
               if (failure) throw failure;
@@ -1580,10 +1593,33 @@ export function createChatGptWebAdapter(
                   return;
                 }
                 validateBatchTools(parsed, next.requests);
-                session.setOutstanding(next.requests, roundReasoning, session.roundEvents(roundKey));
+                let requests = next.requests;
+                const recovery = session.runtime.stallRecovery;
+                if (recovery?.completed.size) {
+                  const unfinished: BrokerToolRequest[] = [];
+                  for (const request of requests) {
+                    const saved = findStallRecoveryResult(recovery, request);
+                    if (!saved) { unfinished.push(request); continue; }
+                    const visible = { ...saved, toolCallId: request.callId };
+                    const result = brokerResult(visible);
+                    await broker.completeTool(turnToken, request.callId, result);
+                    retainedUsage?.addToolResult(visible, result);
+                    externalProgress.recordToolResult();
+                    console.info(`[chatgpt-web] stream_recovery_tool_reused ${JSON.stringify({ traceId })}`);
+                  }
+                  if (unfinished.length === 0) {
+                    nextTools = armNextTools();
+                    continue;
+                  }
+                  // The replacement has moved on to new work. A later repeated observation
+                  // may be intentional after state changes from these new native calls.
+                  recovery.completed.clear();
+                  requests = unfinished;
+                }
+                session.setOutstanding(requests, roundReasoning, session.roundEvents(roundKey));
                 emitRoundBatch(buffer => emitToolBatch(
-                  next.requests,
-                  roundUsage({ reasoning: roundReasoning, toolRequests: next.requests }),
+                  requests,
+                  roundUsage({ reasoning: roundReasoning, toolRequests: requests }),
                   buffer,
                 ));
                 session.completeRound(roundKey);
@@ -1612,6 +1648,24 @@ export function createChatGptWebAdapter(
           const settled = awaitingRuntime ? session.settledOutcome() : undefined;
           if (settled?.type === "error") error = settled.error;
           const turnError = submittedTurnFailure(session, error, parsed);
+          if (turnError instanceof ChatGptWebAdapterError && turnError.code === "chatgpt_stream_stalled"
+            && !incoming.abortSignal?.aborted && !parsed._compactionRequest && session.runtime.mode === "tools"
+            && !session.runtime.stallRecovery && session.runtime.submission?.phase === "accepted") {
+            const previousEvents = session.roundEvents(roundKey);
+            const partial = previousEvents.flatMap(event =>
+              event.type === "text_delta" && event.phase === "final_answer" ? [event.text] : []).join("");
+            const dispatched = session.dispatchedToolIds();
+            const recovery = createStallRecovery(parsed.context.messages, dispatched, partial);
+            const replacementTrace = createHash("sha256").update(`${traceId}:stream_recovery`).digest("hex").slice(0, 12);
+            const boundary: AdapterEvent = { type: "assistant_boundary" };
+            const prelude = [...previousEvents, boundary];
+            if (recovery && chatGptTurnSessions.prepareStallReplacement(executionKey, session, { roundKey, traceId: replacementTrace, recovery, prelude })) {
+              console.info(`[chatgpt-web] stream_recovery_begin ${JSON.stringify({ traceId, replacementTrace, completedTools: dispatched.size })}`);
+              emit(boundary);
+              acknowledgedRecoveryPrelude = prelude.length;
+              return runChatGptWebTurn();
+            }
+          }
           const handledError = turnError instanceof ChatGptWebAdapterError && turnError.retryable
             ? chatGptWebTurnRetryPolicy.recordRetryableFailure(retryKey, turnError)
             : turnError;

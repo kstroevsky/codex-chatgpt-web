@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ChatGptRetainedUsage } from "./retained-usage";
+import type { ChatGptStallRecovery } from "./stall-recovery";
 import type { AdapterEvent, CodexParsedRequest } from "../../types";
 import type { BrokerToolRequest } from "./turn-broker";
 import { ChatGptWebAdapterError, chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
@@ -170,12 +171,20 @@ interface ChatGptTurnRuntimeBase {
   cancel: (reason?: Error) => void;
 }
 
+interface ChatGptStallReplacement {
+  roundKey: string;
+  traceId: string;
+  recovery: ChatGptStallRecovery;
+  prelude: AdapterEvent[];
+}
+
 export type ChatGptTurnRuntime =
   | (ChatGptTurnRuntimeBase & {
     mode: "tools";
     token: Promise<string>;
     externalProgress: ChatGptExternalTurnProgress;
     retainedUsage?: ChatGptRetainedUsage;
+    stallRecovery?: ChatGptStallRecovery;
   })
   | (ChatGptTurnRuntimeBase & { mode: "read-only" });
 
@@ -288,6 +297,7 @@ export class ChatGptTurnSession {
   private lastTouchedAt = this.createdAt;
   readonly browserOutcome: Promise<ChatGptBrowserOutcome>;
   readonly physicalSettlement: Promise<void>;
+  stallReplacement?: ChatGptStallReplacement;
   private readonly outstandingById = new Map<string, BrokerToolRequest>();
   private readonly deliveredResultIds = new Set<string>();
   private outstandingReasoning: string[] = [];
@@ -397,6 +407,16 @@ export class ChatGptTurnSession {
 
   hasOutstanding(callId: string): boolean {
     return this.outstandingById.has(callId);
+  }
+
+  dispatchedToolIds(): ReadonlySet<string> {
+    return new Set([...this.deliveredResultIds, ...this.outstandingById.keys()]);
+  }
+
+  inheritCompletedRounds(previous: ChatGptTurnSession): void {
+    for (const [key, round] of previous.rounds) {
+      if (round.completed) this.rounds.set(key, round);
+    }
   }
 
   markResultDelivered(callId: string): void {
@@ -562,12 +582,13 @@ export class ChatGptTurnSessions {
   async getOrCreateAfterOwnerRetirement(
     key: string,
     ownerKey: string,
-    start: () => ChatGptTurnRuntime,
+    start: (replacement?: ChatGptStallReplacement) => ChatGptTurnRuntime,
     traceId?: string,
     signal?: AbortSignal,
     nativeTurnId?: string,
     nativeThreadId?: string,
     instruction?: ChatGptInstructionLineage,
+    roundKey?: string,
   ): Promise<ChatGptTurnSession> {
     for (;;) {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
@@ -575,6 +596,22 @@ export class ChatGptTurnSessions {
       if (existing) {
         if (existing.supersededError) throw existing.supersededError;
         existing.touch();
+        const replacement = existing.stallReplacement;
+        if (replacement && replacement.roundKey === roundKey) {
+          await awaitWithAbort(existing.physicalSettlement, signal);
+          if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+          if (this.entries.get(key) !== existing) continue;
+          this.entries.delete(key);
+          try {
+            const recovered = this.getOrCreate(key, () => start(replacement), replacement.traceId, ownerKey, nativeTurnId, nativeThreadId, instruction?.current);
+            recovered.inheritCompletedRounds(existing);
+            recovered.appendRoundEvents(roundKey, replacement.prelude);
+            return recovered;
+          } catch (error) {
+            this.entries.set(key, existing);
+            throw error;
+          }
+        }
         return existing;
       }
       const pending = this.retirements.get(key) ?? this.ownerRetirements.get(ownerKey);
@@ -724,6 +761,16 @@ export class ChatGptTurnSessions {
   retire(key: string, session: ChatGptTurnSession): boolean {
     if (this.entries.get(key) !== session) return false;
     this.entries.delete(key);
+    this.forgetConversationHead(session);
+    this.beginRetirement(key, session);
+    return true;
+  }
+
+  prepareStallReplacement(key: string, session: ChatGptTurnSession, replacement: ChatGptStallReplacement): boolean {
+    if (this.entries.get(key) !== session || session.stallReplacement) return false;
+    // Leave the exact native round's plan attached until an observer can start it. A
+    // disconnected HTTP observer cannot erase it, and a native interrupt can still cancel it.
+    session.stallReplacement = replacement;
     this.forgetConversationHead(session);
     this.beginRetirement(key, session);
     return true;

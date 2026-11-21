@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildResponseJSON } from "../src/bridge";
-import { ChatGptWebAdapterError, chatGptStoppedThinkingError, chatGptResponseIncompleteError, chatGptToolApprovalRequiredError } from "../src/adapters/chatgpt-web/adapter-error";
+import { ChatGptWebAdapterError, chatGptStoppedThinkingError, chatGptResponseIncompleteError, chatGptStreamStalledError, chatGptToolApprovalRequiredError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
@@ -1808,6 +1808,106 @@ describe("ChatGPT outer-native harness v4", () => {
       await broker.close();
     }
   });
+
+  test.each(["saved", "pending", "twice", "reconnect"] as const)("stream stall recovery uses the native tool boundary (%s)", async state => {
+    const socketPath = brokerTestEndpoint(`cgw-stall-${state}-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web", baseUrl: `browser://stream-stall-${state}-${Date.now()}`,
+      chatgptWeb: { brokerSocketPath: socketPath, ...toolCapabilities },
+    };
+    const broker = TurnBroker.forSocket(socketPath);
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run;
+    const stall = Promise.withResolvers<never>();
+    const traces: string[] = [];
+    const command = { cmd: "record-this-work-once", workdir: tempRoot };
+    const result = JSON.stringify({ output: "Saved completed side effect", exit_code: 0 });
+    const initial = rawWireRequest(environmentXml);
+    const executionKey = `${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(initial)}`;
+    worker.run = async turn => {
+      traces.push(turn.traceId);
+      const first = traces.length === 1;
+      const prompt = await turn.prepare();
+      try {
+        await turn.onSendActivated?.();
+        await turn.onSubmitted?.();
+        if (!first) {
+          expect(prompt.text).toContain("Do not repeat completed tool calls.");
+          expect(prompt.text).toContain("Saved completed side effect");
+          expect(prompt.text).toContain("Visible partial answer");
+        }
+        const { bindingId } = await callTurnBroker<{ bindingId: string }>(socketPath, {
+          method: "claim", token: prompt.turnToken!,
+        });
+        const invoke = (args: Record<string, unknown>) => invokeAfterBrowserBoundary(turn, () => callTurnBroker<BrokerToolResult>(socketPath, {
+          method: "invoke", bindingId, wireName: "exec_command", arguments: args,
+        }, 5_000));
+        const response = await Promise.race([invoke({ workdir: command.workdir, cmd: command.cmd }), ...(first ? [stall.promise] : [])]);
+        expect(response.structuredContent).toEqual(JSON.parse(result));
+        if (first) turn.onTextDelta("Visible partial answer");
+        if (first || state === "twice") throw chatGptStreamStalledError();
+        const unfinished = await invoke({ cmd: "finish-unfinished-work", workdir: tempRoot });
+        expect(unfinished.content).toEqual([{ type: "text", text: "New work complete." }]);
+        turn.onTextDelta("Finished remaining work.");
+        return "Finished remaining work.";
+      } finally { prompt.release(); }
+    };
+    const adapter = createChatGptWebAdapter(provider, { broker });
+    const withResult = (request: CodexParsedRequest, events: AdapterEvent[], output?: string) => {
+      const input = structuredClone(request);
+      const call = events.find(event => event.type === "tool_call_start")!;
+      const delta = events.find(event => event.type === "tool_call_delta")!;
+      expect(call?.name).toBe("exec_command");
+      input.context.messages.push({ role: "assistant", timestamp: 3,
+        content: [{ type: "toolCall", id: call.id, name: "exec_command", arguments: JSON.parse(delta.arguments) }] });
+      const raw = (input._rawBody as { input: unknown[] }).input;
+      raw.push({ type: "function_call", call_id: call.id, name: "exec_command", arguments: delta.arguments });
+      if (output !== undefined) {
+        input.context.messages.push({ role: "toolResult", timestamp: 4, toolCallId: call.id, toolName: "exec_command", content: output, isError: false });
+        raw.push({ type: "function_call_output", call_id: call.id, output });
+      }
+      return input;
+    };
+    const run = async (request: CodexParsedRequest, disconnect = false) => {
+      const events: AdapterEvent[] = [];
+      await adapter.runTurn!(request, { headers: new Headers() }, event => {
+        if (disconnect && event.type === "assistant_boundary") throw new Error("observer disconnected during recovery");
+        events.push(event);
+      });
+      return events;
+    };
+    try {
+      const first = await run(initial);
+      if (state === "pending") {
+        stall.reject(chatGptStreamStalledError());
+        await chatGptTurnSessions.find(executionKey)!.browserOutcome;
+      }
+      const next = withResult(initial, first, state === "pending" ? undefined : result);
+      if (state === "reconnect") {
+        await expect(run(next, true)).rejects.toThrow();
+        expect(traces).toHaveLength(1);
+      }
+      const continued = await run(next);
+      if (state === "pending" || state === "twice") {
+        expect(continued.at(-1)).toMatchObject({ type: "error", code: "chatgpt_stream_stalled", retryable: false });
+        expect(continued.filter(event => event.type === "tool_call_start")).toHaveLength(0);
+        expect(traces).toHaveLength(state === "pending" ? 1 : 2);
+      } else {
+        expect(continued.filter(event => event.type === "tool_call_start")).toHaveLength(1);
+        expect(JSON.parse(continued.find(event => event.type === "tool_call_delta")!.arguments).cmd).toBe("finish-unfinished-work");
+        expect(continued.filter(event => event.type === "text_delta" && event.text === "Visible partial answer")).toHaveLength(1);
+        expect((await run(initial)).filter(event => event.type === "tool_call_start")).toEqual(first.filter(event => event.type === "tool_call_start"));
+        const completed = await run(withResult(next, continued, "New work complete."));
+        expect(completed.at(-1)).toMatchObject({ type: "done", endTurn: true });
+        expect(new Set(traces).size).toBe(2);
+        expect(traces).toHaveLength(2);
+      }
+    } finally {
+      worker.run = originalRun;
+      await chatGptTurnSessions.retireAndWait(executionKey);
+      await broker.close();
+    }
+  }, 25_000);
 
   test("prompt preparation preserves its error instead of exposing a revoked MCP token", async () => {
     const socketPath = brokerTestEndpoint(`cgw-prepare-error-${process.pid}-${Date.now()}`);
