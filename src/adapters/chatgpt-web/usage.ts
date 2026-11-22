@@ -14,7 +14,7 @@ import {
   supportsChatGptWebBiggerContext,
   supportsChatGptWebBiggerInlineInput,
 } from "../../chatgpt-web-models";
-import type { CodexParsedRequest, CodexUsage } from "../../types";
+import type { CodexParsedRequest, CodexToolResultMessage, CodexUsage } from "../../types";
 import { isNativeCompactionMessage, isReadableCompactionSummaryText } from "../../responses/compaction";
 import { compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens } from "./input-tokens";
 import {
@@ -196,6 +196,7 @@ export function estimateChatGptWebUsage(
   experimentalSkillAttachments = false,
   appName?: string,
   messageLimits?: ChatGptMessageLimits,
+  browserToolResults?: ReadonlyMap<string, CodexToolResultMessage>,
 ): CodexUsage {
   const evidenceText = roundEvidenceText(evidence);
   const outputTokens = conservativeTextTokens(evidenceText, parsed.modelId);
@@ -207,6 +208,7 @@ export function estimateChatGptWebUsage(
     experimentalSkillAttachments,
     experimentalBiggerContext,
     messageLimits,
+    browserToolResults,
   };
   let compiled: CompiledChatGptWebPrompt;
   try {

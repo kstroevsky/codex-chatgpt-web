@@ -2884,7 +2884,7 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test("replays an ordinary post-tool final after one retained structured compaction handoff", async () => {
+  test("replays an ordinary post-tool final after compaction from canonical results", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h3-adapter-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -2907,25 +2907,19 @@ describe("ChatGPT outer-native harness v4", () => {
     let continuationTurnToken = "";
     let originalBrowserStopped = false;
     let originalBrowserReceivedToolResult = false;
-    let retainedCompactionMessages = 0;
+    let canonicalCompactions = 0;
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
       browserStarts += 1;
-      if (turn.requireRetainedConversation) {
-        retainedCompactionMessages += 1;
-        const prepared = await turn.prepareResume!();
+      expect(turn.requireRetainedConversation).not.toBeTrue();
+      if (turn.compaction) {
+        canonicalCompactions += 1;
+        expect(turn.capabilities.localToolsEnabled).toBeFalse();
+        const prepared = await turn.prepare();
         try {
-          expect(prepared.text).toContain('selected ChatGPT plugin "Codex app"');
-          const controlToken = prepared.text.match(/turn_token (turn_[a-f0-9]{32})/)?.[1];
-          const handoffId = prepared.text.match(/handoff_id (handoff_[a-f0-9]{32})/)?.[1];
-          if (!controlToken || !handoffId) throw new Error("structured compaction binding missing");
-          await callTurnBroker(socketPath, {
-            method: "submit_compaction_handoff",
-            token: controlToken,
-            handoffId,
-            summary: "The project was inspected and the pending command completed.",
-          });
-          originalBrowserStopped = true;
-          return "Structured checkpoint submitted";
+          expect(prepared.turnToken).toBeUndefined();
+          expect(prepared.text).toContain("exec_command");
+          expect(prepared.text).toContain(tempRoot);
+          return "The project was inspected and the pending command completed.";
         } finally {
           prepared.release();
         }
@@ -3039,9 +3033,10 @@ describe("ChatGPT outer-native harness v4", () => {
       const compactEvents: AdapterEvent[] = [];
       await adapter.runTurn!(compactRequest, { headers: new Headers() }, event => compactEvents.push(event));
       expect(compactEvents.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
-      expect(originalBrowserStopped).toBe(true);
+      expect(originalBrowserStopped).toBe(false);
       expect(originalBrowserReceivedToolResult).toBe(true);
-      expect(retainedCompactionMessages).toBe(1);
+      expect(compactEvents.some(event => event.type === "text_delta" && event.text.includes("<codex_execution_receipts_v1>"))).toBeTrue();
+      expect(canonicalCompactions).toBe(1);
       expect(browserStarts).toBe(2);
 
       const compactReplayEvents: AdapterEvent[] = [];
@@ -3051,7 +3046,7 @@ describe("ChatGPT outer-native harness v4", () => {
         event => compactReplayEvents.push(event),
       );
       expect(compactReplayEvents).toEqual(compactEvents);
-      expect(retainedCompactionMessages).toBe(1);
+      expect(canonicalCompactions).toBe(1);
       expect(browserStarts).toBe(2);
 
       const secondRequest = rawWireRequest(environmentXml);

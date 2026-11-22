@@ -241,3 +241,5 @@ export function buildCompactV1Output(
   const summaryText = summary.trim().length > 0 ? `${SUMMARY_PREFIX}\n${summary}` : "(no summary available)";
   return [...selected, compactUserMessageItem(summaryText)];
 }
+
+export const LATEST_USER_PROMPT_MARKER = "CODEX_LATEST_USER_PROMPT_JSON";

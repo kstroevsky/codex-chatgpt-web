@@ -1,3 +1,4 @@
+import type { ChatGptReadOutputReuse } from "./read-output-reuse";
 import { createHash } from "node:crypto";
 import type { AdapterEvent, CodexParsedRequest } from "../../types";
 import type { BrokerToolRequest } from "./turn-broker";
@@ -174,6 +175,7 @@ export type ChatGptTurnRuntime =
     mode: "tools";
     token: Promise<string>;
     externalProgress: ChatGptExternalTurnProgress;
+    readOutputReuse?: ChatGptReadOutputReuse;
   })
   | (ChatGptTurnRuntimeBase & { mode: "read-only" });
 
