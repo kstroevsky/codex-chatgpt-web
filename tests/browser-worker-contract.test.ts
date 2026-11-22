@@ -4132,7 +4132,9 @@ test("browser DOM health fails closed on a vanished or empty ChatGPT response", 
     completionActionVisible: false,
   };
   expect(missing.update(absent, 1_000)).toBeUndefined();
-  expect(missing.update(absent, 2_000)).toContain("did not create a response DOM");
+  const disappeared = missing.update(absent, 2_000)!;
+  expect(disappeared).toContain("did not create a response DOM");
+  expect(missing.failure(disappeared).code).toBe("chatgpt_response_incomplete");
 
   const empty = new ChatGptTurnDomHealthTracker(1_000, 500);
   const terminal = {
@@ -4152,7 +4154,9 @@ test("browser DOM health fails closed on a vanished or empty ChatGPT response", 
   };
   expect(missingCompletionAction.update(completedWithoutMarker, 1_000)).toBeUndefined();
   expect(missingCompletionAction.update(completedWithoutMarker, 1_749)).toBeUndefined();
-  expect(missingCompletionAction.update(completedWithoutMarker, 1_750)).toContain("without a final answer");
+  const timedOut = missingCompletionAction.update(completedWithoutMarker, 1_750)!;
+  expect(timedOut).toContain("without a final answer");
+  expect(missingCompletionAction.failure(timedOut).code).toBe("chatgpt_final_answer_timeout");
 });
 
 test("visible generation suspends DOM health and restarts its grace when Stop disappears", () => {

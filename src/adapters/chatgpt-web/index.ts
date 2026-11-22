@@ -345,6 +345,11 @@ function submittedTurnFailure(session: ChatGptTurnSession, error: unknown, parse
   );
 }
 
+function compactionBrowserLost(error: unknown): error is ChatGptWebAdapterError {
+  return error instanceof ChatGptWebAdapterError && (error.code === "chatgpt_response_binding_lost"
+    || error.code === "chatgpt_final_answer_timeout" || error.code === "chatgpt_stream_stalled");
+}
+
 function currentToolResults(parsed: CodexParsedRequest, session: ChatGptTurnSession): CodexToolResultMessage[] {
   const byId = new Map<string, CodexToolResultMessage>();
   for (const message of parsed.context.messages) {
@@ -1026,6 +1031,7 @@ export function createChatGptWebAdapter(
               .digest("hex")
               .slice(0, 12);
             const freshCompactionTraceId = `${handoffTraceId}_${freshConversationPerTurn ? "fresh" : "fallback"}`;
+            const freshCompactionRetryTraceId = `${freshCompactionTraceId}_rebind1`;
             const compactionNativeIdentity = extractChatGptTurnIdentity(parsed);
             let sharedSummary = existingStructuredCompactionRun(compactionExecutionKey);
             if (!sharedSummary) {
@@ -1037,6 +1043,7 @@ export function createChatGptWebAdapter(
                     compactionTraceId,
                     handoffTraceId,
                     freshCompactionTraceId,
+                    freshCompactionRetryTraceId,
                   ],
                   ...(compactionNativeIdentity.threadId
                     ? { nativeThreadId: compactionNativeIdentity.threadId }
@@ -1109,24 +1116,35 @@ export function createChatGptWebAdapter(
                     // Fresh compaction is a bounded phase. Each exact multipart acknowledgement
                     // and the final accepted compact prompt re-arms the five-minute liveness budget;
                     // transport time cannot consume the model-generation window.
-                    armHandoffDeadline();
-                    const fallbackRuntime = startRuntime(
-                      parsed,
-                      manualRequest ? environment : undefined,
-                      freshCompactionTraceId,
-                      turnCapabilities,
-                      { onCompactionProgress: armHandoffDeadline },
-                    );
-                    retainOwnershipUntil(fallbackRuntime.physicalSettlement);
-                    try {
-                      const rawSummary = await withAbort(fallbackRuntime.browser, operationSignal);
-                      await withAbort(fallbackRuntime.physicalSettlement, operationSignal);
-                      return canonicalizeCompactionHandoff(parsed, rawSummary);
-                    } catch (error) {
-                      fallbackRuntime.cancel(error instanceof Error ? error : new Error(String(error)));
-                      // The shared owner retains physical settlement independently of this error.
-                      // Neither a timeout nor operator cancellation can open a competing trace.
-                      throw error;
+                    for (let attempt = 0; ; attempt++) {
+                      operationSignal.throwIfAborted();
+                      armHandoffDeadline();
+                      const fallbackRuntime = startRuntime(
+                        parsed,
+                        manualRequest ? environment : undefined,
+                        attempt === 0 ? freshCompactionTraceId : freshCompactionRetryTraceId,
+                        turnCapabilities,
+                        { onCompactionProgress: armHandoffDeadline },
+                      );
+                      retainOwnershipUntil(fallbackRuntime.physicalSettlement);
+                      try {
+                        const rawSummary = await withAbort(fallbackRuntime.browser, operationSignal);
+                        await withAbort(fallbackRuntime.physicalSettlement, operationSignal);
+                        return canonicalizeCompactionHandoff(parsed, rawSummary);
+                      } catch (error) {
+                        fallbackRuntime.cancel(error instanceof Error ? error : new Error(String(error)));
+                        // This checkpoint has no work tools. Try one replacement only after
+                        // positively losing the owned response and waiting for its browser to retire.
+                        if (manualRequest || operationSignal.aborted || !compactionBrowserLost(error)) throw error;
+                        if (attempt > 0) {
+                          throw new ChatGptWebAdapterError(`The replacement checkpoint also failed. ${error.message}`, {
+                            status: error.status, errorType: error.errorType, code: "compaction_browser_recovery_exhausted",
+                            retryable: false, cause: error,
+                          });
+                        }
+                        await withAbort(fallbackRuntime.physicalSettlement, operationSignal);
+                        console.info(`[chatgpt-web] fresh_compaction_browser_recovery ${JSON.stringify({ traceId: freshCompactionRetryTraceId })}`);
+                      }
                     }
                   };
                   let source: ChatGptTurnSession | undefined;
@@ -1263,9 +1281,9 @@ export function createChatGptWebAdapter(
                         "Structured compaction failed and its retained conversation could not be retired",
                       );
                     }
-                    if (handoffError instanceof ChatGptWebAdapterError
-                      && handoffError.code === "compaction_source_unavailable") {
-                      return await runFreshCompaction("source_disappeared_before_handoff");
+                    if (!operationSignal.aborted && handoffPhase !== "fresh_compaction" && handoffError instanceof ChatGptWebAdapterError
+                      && (handoffError.code === "compaction_source_unavailable" || (!manualRequest && compactionBrowserLost(handoffError)))) {
+                      return await runFreshCompaction(handoffError.code);
                     }
                     throw handoffError;
                   } finally {
@@ -1648,7 +1666,8 @@ export function createChatGptWebAdapter(
           const settled = awaitingRuntime ? session.settledOutcome() : undefined;
           if (settled?.type === "error") error = settled.error;
           const turnError = submittedTurnFailure(session, error, parsed);
-          if (turnError instanceof ChatGptWebAdapterError && turnError.code === "chatgpt_stream_stalled"
+          if (turnError instanceof ChatGptWebAdapterError
+            && (turnError.code === "chatgpt_stream_stalled" || turnError.code === "chatgpt_final_answer_timeout")
             && !incoming.abortSignal?.aborted && !parsed._compactionRequest && session.runtime.mode === "tools"
             && !session.runtime.stallRecovery && session.runtime.submission?.phase === "accepted") {
             const previousEvents = session.roundEvents(roundKey);

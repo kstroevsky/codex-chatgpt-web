@@ -103,6 +103,8 @@ import {
   chatGptStoppedThinkingError,
   chatGptResponseIncompleteError,
   chatGptStreamStalledError,
+  chatGptFinalAnswerTimeoutError,
+  chatGptResponseBindingLostError,
   chatGptToolApprovalRequiredError,
 } from "./adapter-error";
 import {
@@ -1147,6 +1149,7 @@ export class ChatGptTurnDomHealthTracker {
   private missingResponseSince?: number;
   private emptyCompletionSince?: number;
   private missingCompletionAction?: { text: string; activityText?: string; since: number };
+  private finalAnswerTimedOut = false;
 
   constructor(
     private readonly missingResponseMs = CHATGPT_RESPONSE_DOM_GRACE_MS,
@@ -1173,6 +1176,7 @@ export class ChatGptTurnDomHealthTracker {
     responseStreamActive?: boolean;
     activityText?: string;
   }, now = Date.now()): string | undefined {
+    this.finalAnswerTimedOut = false;
     if (state.responsePresent) this.sawResponse = true;
     if (state.externalProgressLive || state.running || state.responseStreamActive) {
       // Every conclusion below asserts that ChatGPT stopped producing this turn. A tool call that
@@ -1214,9 +1218,14 @@ export class ChatGptTurnDomHealthTracker {
       || this.missingCompletionAction?.activityText !== state.activityText) {
       this.missingCompletionAction = { text: state.currentText, activityText: state.activityText, since: now };
     } else if (now - this.missingCompletionAction.since >= this.missingCompletionActionMs) {
+      this.finalAnswerTimedOut = true;
       return `ChatGPT has shown no new response activity for ${this.missingCompletionActionMs / 1_000} seconds without a final answer. Check the ChatGPT tab before retrying.`;
     }
     return undefined;
+  }
+
+  failure(message: string): ChatGptWebAdapterError {
+    return this.finalAnswerTimedOut ? chatGptFinalAnswerTimeoutError(message) : chatGptResponseIncompleteError(message);
   }
 }
 
@@ -2959,14 +2968,14 @@ export class ChatGptBrowserWorker {
         // Activity can replace its temporary group while still generating; requiring
         // a completed answer here mistakes that same unfinished turn for a foreign one.
       }
-      if (!matches) throw new Error("ChatGPT opened another user turn while the bound assistant response was detached");
+      if (!matches) throw chatGptResponseBindingLostError("ChatGPT opened another user turn while the bound assistant response was detached");
       // Expanding a truncated bubble can yield to another DOM update. Keep the
       // no-competing-turn check valid after that action, not just before it.
       const current = await this.submissionDomState(page, baseline.domCache, signal);
       if (!current.userIdentities.includes(user) || !current.responseIdentities.includes(identity!)
         || current.turnIdentities.includes(binding.identity)
         || current.turnIdentities.some(turn => !acceptedTurns.has(turn) && turn !== user && turn !== identity)) {
-        throw new Error("ChatGPT changed conversation turns while verifying the submitted message");
+        throw chatGptResponseBindingLostError("ChatGPT changed conversation turns while verifying the submitted message");
       }
     }
     if (!identity || identity === binding.identity) return binding;
@@ -3657,7 +3666,7 @@ export class ChatGptBrowserWorker {
         responseStreamActive,
         activityText: JSON.stringify(snapshot.traceBlocks),
       });
-      if (domError) throw chatGptResponseIncompleteError(domError);
+      if (domError) throw domHealthTracker.failure(domError);
       if (completionTracker.update({
         responsePresent: snapshot.responsePresent,
         running,
@@ -4793,7 +4802,8 @@ export class ChatGptBrowserWorker {
         : (error instanceof DOMException && error.name === "AbortError")
         // Close a proven-stalled tab before the replacement can send. The diagnostic
         // snapshot already lives on disk and the abandoned page must stop running.
-        || (error instanceof ChatGptWebAdapterError && (error.code === "client_cancelled" || error.code === "chatgpt_stream_stalled"))
+        || (error instanceof ChatGptWebAdapterError && (error.code === "client_cancelled" || error.code === "chatgpt_stream_stalled"
+          || error.code === "chatgpt_final_answer_timeout" || (turn.compaction && error.code === "chatgpt_response_binding_lost")))
         ? "aborted"
         : "failed";
       terminalMessage = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
@@ -5580,7 +5590,7 @@ export class ChatGptBrowserWorker {
             responseStreamActive,
             activityText: JSON.stringify(snapshot.traceBlocks),
           });
-          if (domError) throw chatGptResponseIncompleteError(domError);
+          if (domError) throw domHealthTracker.failure(domError);
           const completionReady = completionTracker.update({
             responsePresent: snapshot.responsePresent,
             running,
@@ -5659,7 +5669,7 @@ export class ChatGptBrowserWorker {
             externalProgressLive,
             responseStreamActive,
           });
-          if (domError) throw chatGptResponseIncompleteError(domError);
+          if (domError) throw domHealthTracker.failure(domError);
         }
         if (!turn.compaction && externalProgressSnapshot && openStreamWatchdog.stalled(
           snapshot, responseStreamActive ? streamDiagnostics.openStreamLastActivity() : undefined,

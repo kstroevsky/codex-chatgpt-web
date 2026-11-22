@@ -49,6 +49,18 @@ export function chatGptStreamStalledError(): ChatGptWebAdapterError {
   });
 }
 
+export function chatGptFinalAnswerTimeoutError(message: string): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(message, {
+    status: 504, errorType: "server_error", code: "chatgpt_final_answer_timeout", retryable: false,
+  });
+}
+
+export function chatGptResponseBindingLostError(message: string): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(message, {
+    status: 409, errorType: "invalid_request_error", code: "chatgpt_response_binding_lost", retryable: false,
+  });
+}
+
 export function chatGptToolApprovalRequiredError(): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(
     "ChatGPT is waiting for plugin permission. Open the plugin's settings in ChatGPT, "

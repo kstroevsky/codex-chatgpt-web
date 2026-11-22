@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildResponseJSON } from "../src/bridge";
-import { ChatGptWebAdapterError, chatGptStoppedThinkingError, chatGptResponseIncompleteError, chatGptStreamStalledError, chatGptToolApprovalRequiredError } from "../src/adapters/chatgpt-web/adapter-error";
+import { ChatGptWebAdapterError, chatGptStoppedThinkingError, chatGptResponseIncompleteError, chatGptFinalAnswerTimeoutError, chatGptStreamStalledError, chatGptToolApprovalRequiredError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
@@ -1809,7 +1809,7 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test.each(["saved", "pending", "twice", "reconnect"] as const)("stream stall recovery uses the native tool boundary (%s)", async state => {
+  test.each(["saved", "pending", "twice", "reconnect", "final-timeout"] as const)("stream stall recovery uses the native tool boundary (%s)", async state => {
     const socketPath = brokerTestEndpoint(`cgw-stall-${state}-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web", baseUrl: `browser://stream-stall-${state}-${Date.now()}`,
@@ -1845,7 +1845,8 @@ describe("ChatGPT outer-native harness v4", () => {
         const response = await Promise.race([invoke({ workdir: command.workdir, cmd: command.cmd }), ...(first ? [stall.promise] : [])]);
         expect(response.structuredContent).toEqual(JSON.parse(result));
         if (first) turn.onTextDelta("Visible partial answer");
-        if (first || state === "twice") throw chatGptStreamStalledError();
+        if (first || state === "twice") throw state === "final-timeout"
+          ? chatGptFinalAnswerTimeoutError("The final answer timed out.") : chatGptStreamStalledError();
         const unfinished = await invoke({ cmd: "finish-unfinished-work", workdir: tempRoot });
         expect(unfinished.content).toEqual([{ type: "text", text: "New work complete." }]);
         turn.onTextDelta("Finished remaining work.");
