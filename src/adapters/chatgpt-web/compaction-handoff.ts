@@ -476,10 +476,9 @@ export function runStructuredCompactionOnce(
   // Return a deadline failure promptly, while its physical browser owner still blocks retries
   // and cancel-all completion. A cancelled queued run must also retain its predecessor's gate.
   const ownerSettlement = promise.then(() => false, error => {
-    // Native retries of the identical oversized input cannot fix a size rejection. Replay that
-    // terminal result under the existing cache lifetime; reduced input/model changes get a new key.
-    return !(error instanceof ChatGptWebAdapterError
-      && error.code === "context_length_exceeded" && !error.retryable);
+    // Replay terminal size and exhausted recovery results across reconnects.
+    return !(error instanceof ChatGptWebAdapterError && !error.retryable
+      && (error.code === "context_length_exceeded" || error.code === "compaction_browser_recovery_exhausted"));
   }).then(async evict => {
     await Promise.allSettled(physicalSettlements);
     run.active = false;

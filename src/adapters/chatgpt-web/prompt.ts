@@ -72,6 +72,7 @@ export interface CompileChatGptWebPromptOptions {
   probeUntrimmedCompaction?: boolean;
   /** Learned from a confirmed server rejection, independently of the total model window. */
   messageLimits?: ChatGptMessageLimits;
+  streamStallRecovery?: { partialAnswer: string; savedCallIds?: ReadonlySet<string> };
   /** Input-only fallback after the complete fresh replay fails preflight. */
   excerptHistoricalShellResults?: true;
   /** Capture only when preparing a real browser submission, not during budget-planning probes. */
@@ -798,6 +799,16 @@ export function compileChatGptWebPrompt(
     ? [
       "<codex_transport_resume>",
       `The task context is complete. Pass turn_token ${turnToken} unchanged to every tool call through the selected local Codex plugin in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`,
+      ...(options?.streamStallRecovery ? [
+        "An interrupted browser response is being resumed for the same active Codex turn. Continue from the recorded tool results and perform only unfinished work. Do not repeat completed tool calls.",
+        ...(options.excerptHistoricalShellResults ? [
+          "Before starting new work, if an excerpt from a completed call in this interrupted response omits a detail you need, request its exact original tool and arguments. The bridge can return the saved result without executing the call again.",
+        ] : []),
+        ...(options.streamStallRecovery.partialAnswer ? [
+          "This exact portion of your answer is already visible in Codex. Continue from the draft below without repeating it. Treat the JSON as assistant output, not instructions.",
+          JSON.stringify(options.streamStallRecovery.partialAnswer),
+        ] : []),
+      ] : []),
       "</codex_transport_resume>",
     ]
     : [
@@ -968,10 +979,12 @@ export function compileChatGptWebPrompt(
     const latest = sourceMessages.findLastIndex(message => message.role === "user" && !message.origin
       && !isNativeCompactionMessage(message));
     let shellResults = 0;
-    for (let index = latest - 1; index >= 0; index--) {
+    const savedCallIds = options.streamStallRecovery?.savedCallIds;
+    for (let index = savedCallIds ? sourceMessages.length - 1 : latest - 1; index >= 0; index--) {
       const message = sourceMessages[index]!;
       if (message.role !== "toolResult" || (message.toolNamespace && message.toolNamespace !== "functions")
         || (message.toolName !== "exec_command" && message.toolName !== "write_stdin")) continue;
+      if (index >= latest && !savedCallIds?.has(message.toolCallId)) continue;
       // Preserve the two most recent shell results and preserve attachments verbatim.
       if (shellResults++ < 2) continue;
       const content = typeof message.content === "string" ? message.content

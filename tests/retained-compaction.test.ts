@@ -7,7 +7,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker, chatGptSuspensionClock } from "../src/adapters/chatgpt-web/browser-worker";
-import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError, chatGptRetainedConversationUnavailableError } from "../src/adapters/chatgpt-web/adapter-error";
+import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError, chatGptResponseBindingLostError, chatGptRetainedConversationUnavailableError } from "../src/adapters/chatgpt-web/adapter-error";
 import {
   MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   cancelAllStructuredCompactions,
@@ -1776,7 +1776,14 @@ test("a timed-out fresh compaction retains its owner until helper cleanup comple
   }
 });
 
-test.each([false, true])("structured compact rebuild after retained browser loss preserves rate limit=%s", async rateLimited => {
+test.each([
+  { scenario: "retained browser loss", rateLimited: false },
+  { scenario: "detached retained response uses canonical history", retainedBindingLost: true, rateLimited: false },
+  { scenario: "detached fresh response gets one replacement", freshBindingLosses: 1, rateLimited: false },
+  { scenario: "a second detached fresh response stays terminal", freshBindingLosses: 2, rateLimited: false },
+  { scenario: "explicit refusal ends the attempt", refuses: true, rateLimited: false },
+  { scenario: "retained browser loss preserves rate limit", rateLimited: true },
+])("structured compaction browser recovery: %j", async ({ rateLimited, retainedBindingLost, freshBindingLosses = 0, refuses }) => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-stale-retained-compact-"));
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
@@ -1808,25 +1815,49 @@ test.each([false, true])("structured compact rebuild after retained browser loss
   await chatGptTurnSessions.find(sourceKey)!.browserOutcome;
 
   let browserStarts = 0;
+  const bindingError = () => chatGptResponseBindingLostError("ChatGPT opened another user turn while the bound assistant response was detached");
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     browserStarts += 1;
-    if (turn.requireRetainedConversation) throw chatGptRetainedConversationUnavailableError();
+    if (turn.requireRetainedConversation) {
+      if (refuses) return "I cannot provide the requested context summary.";
+      if (retainedBindingLost) throw bindingError();
+      throw chatGptRetainedConversationUnavailableError();
+    }
+    expect(turn.capabilities.localToolsEnabled).toBeFalse();
+    expect(turn.nativeConnector).toBeUndefined();
     const prepared = await turn.prepare();
     expect(prepared.text).toContain("Original task");
     prepared.release();
+    if (browserStarts - 1 <= freshBindingLosses) throw bindingError();
     if (rateLimited) throw new ChatGptWebAdapterError("ChatGPT rate limit: too many requests.", {
       status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: false,
     });
     return "Fallback checkpoint after retained browser loss";
   };
   const events: AdapterEvent[] = [];
+  const adapter = createChatGptWebAdapter(provider);
+  const compact = request(true);
   try {
-    await createChatGptWebAdapter(provider).runTurn!(
-      request(true),
+    await adapter.runTurn!(
+      compact,
       { headers: new Headers() },
       event => events.push(event),
     );
-    expect(browserStarts).toBe(2);
+    if (refuses) {
+      expect(browserStarts).toBe(1);
+      expect(events.at(-1)).toMatchObject({ type: "error", code: "compaction_handoff_missing", retryable: false });
+      return;
+    }
+    const expectedStarts = freshBindingLosses > 0 ? 3 : 2;
+    expect(browserStarts).toBe(expectedStarts);
+    if (freshBindingLosses === 2) {
+      expect(events.at(-1)).toMatchObject({ type: "error", code: "compaction_browser_recovery_exhausted", retryable: false });
+      const replay: AdapterEvent[] = [];
+      await adapter.runTurn!(compact, { headers: new Headers() }, event => replay.push(event));
+      expect(replay).toEqual(events);
+      expect(browserStarts).toBe(expectedStarts);
+      return;
+    }
     if (rateLimited) {
       expect(events.at(-1)).toMatchObject({
         type: "error", status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded",
@@ -1838,6 +1869,10 @@ test.each([false, true])("structured compact rebuild after retained browser loss
     expect(events.some(event => event.type === "text_delta"
       && event.text.includes("Fallback checkpoint after retained browser loss"))).toBeTrue();
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+    const replay: AdapterEvent[] = [];
+    await adapter.runTurn!(compact, { headers: new Headers() }, event => replay.push(event));
+    expect(replay).toEqual(events);
+    expect(browserStarts).toBe(expectedStarts);
   } finally {
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     chatGptTurnSessions.clear();

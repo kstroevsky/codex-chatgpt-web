@@ -39,6 +39,7 @@ export class ChatGptStreamProjection {
   private path?: string;
   private operation?: string;
   private frames = 0;
+  private activity = 0;
   private malformed = 0;
   private unresolved = 0;
   private oversized = 0;
@@ -70,6 +71,9 @@ export class ChatGptStreamProjection {
     }
   }
 
+  get activityRevision(): number { return this.activity; }
+  get hasCompletionMarker(): boolean { return this.done; }
+
   snapshot() {
     return { frames: this.frames, doneMarker: this.done, serviceError: this.serviceError,
       serviceErrors: this.serviceErrors.map(error => ({ ...error })),
@@ -91,6 +95,10 @@ export class ChatGptStreamProjection {
     try { value = JSON.parse(data); } catch { this.malformed += 1; return; }
     const event = object(value);
     if (!event) { this.unresolved += 1; return; }
+    // SSE keepalives and JSON events without model data are not progress.
+    const patch = event.v;
+    if (object(event.message) || object(object(patch)?.message)
+      || (typeof patch === "string" && patch.length > 0) || (Array.isArray(patch) && patch.length > 0)) this.activity += 1;
     const keys = (item: Record<string, unknown> | undefined) => item
       ? Object.keys(item).filter(key => ["message", "messages", "id", "author", "role", "channel", "status", "end_turn", "content", "p", "o", "v", "type", "message_id", "delta", "metadata"].includes(key)).sort() : [];
     const shape = JSON.stringify({ keys: keys(event), valueKeys: keys(object(event.v)),
@@ -204,6 +212,7 @@ type Capture = {
   pending: Uint8Array[]; pendingBytes: number; streaming: boolean; unavailable: boolean;
   enabling?: Promise<void>; terminal?: "finished" | "aborted" | "failed" | "detached";
   networkError?: string;
+  lastActivityAt?: number;
 };
 
 /** Owned-page CDP diagnostics, optionally notifying a caller of a confirmed input rejection. */
@@ -220,6 +229,20 @@ export class ChatGptStreamDiagnostics {
   ) {}
 
   begin(): void { this.submission += 1; }
+
+  /** Timestamp for the sole confirmed, open stream in the current submission. */
+  openStreamLastActivity(): number | undefined {
+    const open = [...this.captures.values()].filter(capture =>
+      capture.submission === this.submission && capture.status === 200 && !capture.terminal);
+    if (open.length !== 1 || !open[0]!.streaming || open[0]!.unavailable || open[0]!.projection.hasCompletionMarker) return undefined;
+    return open[0]!.lastActivityAt;
+  }
+
+  private recordData(capture: Capture, bytes: Uint8Array): void {
+    const previous = capture.projection.activityRevision;
+    capture.projection.push(bytes);
+    if (capture.projection.activityRevision !== previous) capture.lastActivityAt = Date.now();
+  }
 
   async attach(page: Page): Promise<void> {
     await this.dispose();
@@ -253,10 +276,11 @@ export class ChatGptStreamDiagnostics {
         if (!capture) return;
         capture.status = event.response.status;
         if (event.response.mimeType !== "text/event-stream") return;
+        capture.lastActivityAt = Date.now();
         capture.enabling = bounded(session!.send("Network.streamResourceContent", { requestId: event.requestId })).then(result => {
           if (generation !== this.generation) return;
-          capture.projection.push(Buffer.from(result.bufferedData, "base64"));
-          capture.pending.forEach(bytes => capture.projection.push(bytes));
+          this.recordData(capture, Buffer.from(result.bufferedData, "base64"));
+          capture.pending.forEach(bytes => this.recordData(capture, bytes));
           capture.streaming = true;
         }).catch(() => { capture.unavailable = true; }).finally(() => {
           capture.pending = [];
@@ -268,7 +292,7 @@ export class ChatGptStreamDiagnostics {
         const capture = this.captures.get(event.requestId);
         if (!capture || !event.data) return;
         const bytes = Buffer.from(event.data, "base64");
-        if (capture.streaming) capture.projection.push(bytes);
+        if (capture.streaming) this.recordData(capture, bytes);
         else if (capture.pendingBytes + bytes.length <= 1_000_000) {
           capture.pending.push(bytes); capture.pendingBytes += bytes.length;
         } else capture.unavailable = true;

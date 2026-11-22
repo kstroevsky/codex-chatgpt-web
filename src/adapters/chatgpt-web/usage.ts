@@ -29,6 +29,8 @@ import type { BrokerToolRequest } from "./turn-broker";
 
 // The real capability has the same length. Keeping it out of usage accounting would make
 // estimates differ slightly between the prepared browser prompt and later Codex tool rounds.
+const STALL_RECOVERY_TOOL_HEADROOM_TOKENS = 2_500;
+
 const ESTIMATE_TURN_TOKEN = "turn_00000000000000000000000000000000";
 
 export interface ChatGptWebRoundEvidence {
@@ -112,20 +114,42 @@ export function compileFreshChatGptWebPrompt(
   parsed: CodexParsedRequest, capabilities: ChatGptWebCapabilities, turnToken?: string,
   options: CompileChatGptWebPromptOptions = {},
 ): CompiledChatGptWebPrompt {
+  const compileExcerpted = () => compileBiggerContextPrompt(parsed, capabilities, turnToken, {
+    ...options, excerptHistoricalShellResults: true,
+  });
+  const capacityError = (error: unknown): boolean => error instanceof ChatGptWebAdapterError
+    && (error.code === "context_length_exceeded" || error.code === "chatgpt_message_transport_capacity_exceeded");
   try {
-    return compileBiggerContextPrompt(parsed, capabilities, turnToken, options);
+    const complete = compileBiggerContextPrompt(parsed, capabilities, turnToken, options);
+    if (options.streamStallRecovery?.savedCallIds?.size) {
+      const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities);
+      if (supportsChatGptWebBiggerInlineInput(parsed.modelId, mode.effort, capabilities)) {
+        const { autoCompactTokenLimit } = resolveChatGptWebContextLimits(
+          CHATGPT_WEB_BACKEND_MODEL, mode.effort, { ...capabilities, experimentalBiggerContext: true }, parsed._chatgptModelFamily,
+        );
+        // Leave room for the next productive shell result when a replacement would otherwise
+        // start near the threshold. The completed call results stay available through the broker.
+        const estimate = estimateCompiledChatGptWebInputTokens(complete, parsed.modelId, options.multipartTransactionId);
+        if (estimate >= autoCompactTokenLimit - STALL_RECOVERY_TOOL_HEADROOM_TOKENS) {
+          try {
+            const excerpted = compileExcerpted();
+            if (excerpted.historicalShellExcerpts) return excerpted;
+          } catch (error) {
+            if (!capacityError(error)) throw error;
+          }
+        }
+      }
+    }
+    return complete;
   } catch (error) {
     const latest = parsed.context.messages.at(-1);
-    if (!(error instanceof ChatGptWebAdapterError)
-      || (error.code !== "context_length_exceeded" && error.code !== "chatgpt_message_transport_capacity_exceeded")
+    if (!capacityError(error)
       || !capabilities.localToolsEnabled || parsed._compactionRequest
-      || latest?.role !== "user" || latest.origin || isNativeCompactionMessage(latest)
-      || isReadableCompactionSummaryText(latest.content)) throw error;
+      || (!options.streamStallRecovery && (latest?.role !== "user" || latest.origin || isNativeCompactionMessage(latest)
+        || isReadableCompactionSummaryText(latest.content)))) throw error;
     const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities);
     if (!supportsChatGptWebBiggerInlineInput(parsed.modelId, mode.effort, capabilities)) throw error;
-    const recovered = compileBiggerContextPrompt(parsed, capabilities, turnToken, {
-      ...options, excerptHistoricalShellResults: true,
-    });
+    const recovered = compileExcerpted();
     if (!recovered.historicalShellExcerpts) throw error;
     return recovered;
   }

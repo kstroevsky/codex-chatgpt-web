@@ -8,7 +8,7 @@ import { createContext, runInContext } from "node:vm";
 import type { Page } from "playwright-core";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptSubmissionRejectionObserver, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, browserDiagnosticCheckpoint, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
-import { chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_OPEN_STREAM_IDLE_MS, ChatGptOpenStreamWatchdog, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -4132,7 +4132,9 @@ test("browser DOM health fails closed on a vanished or empty ChatGPT response", 
     completionActionVisible: false,
   };
   expect(missing.update(absent, 1_000)).toBeUndefined();
-  expect(missing.update(absent, 2_000)).toContain("did not create a response DOM");
+  const disappeared = missing.update(absent, 2_000)!;
+  expect(disappeared).toContain("did not create a response DOM");
+  expect(missing.failure(disappeared).code).toBe("chatgpt_response_incomplete");
 
   const empty = new ChatGptTurnDomHealthTracker(1_000, 500);
   const terminal = {
@@ -4152,7 +4154,9 @@ test("browser DOM health fails closed on a vanished or empty ChatGPT response", 
   };
   expect(missingCompletionAction.update(completedWithoutMarker, 1_000)).toBeUndefined();
   expect(missingCompletionAction.update(completedWithoutMarker, 1_749)).toBeUndefined();
-  expect(missingCompletionAction.update(completedWithoutMarker, 1_750)).toContain("without a final answer");
+  const timedOut = missingCompletionAction.update(completedWithoutMarker, 1_750)!;
+  expect(timedOut).toContain("without a final answer");
+  expect(missingCompletionAction.failure(timedOut).code).toBe("chatgpt_final_answer_timeout");
 });
 
 test("visible generation suspends DOM health and restarts its grace when Stop disappears", () => {
@@ -4164,6 +4168,26 @@ test("visible generation suspends DOM health and restarts its grace when Stop di
   expect(tracker.update(absent, 61_000)).toBeUndefined();
   expect(tracker.update(absent, 61_999)).toBeUndefined();
   expect(tracker.update(absent, 62_000)).toContain("did not create a response DOM");
+});
+
+test("an open stream stalls only after stream, rendered response and native tools are all quiet", () => {
+  const watchdog = new ChatGptOpenStreamWatchdog();
+  const tools = new ChatGptExternalTurnProgress();
+  const initial = { visibleText: "", traceBlocks: [] };
+  const idle = CHATGPT_OPEN_STREAM_IDLE_MS;
+  expect(watchdog.stalled(initial, 1, tools.snapshot(), 1)).toBeFalse();
+  expect(watchdog.stalled(initial, 1, tools.snapshot(), idle)).toBeFalse();
+  expect(watchdog.stalled(initial, undefined, tools.snapshot(), idle + 1)).toBeFalse();
+  expect(watchdog.stalled(initial, 1, tools.snapshot(), idle + 1)).toBeTrue();
+  expect(watchdog.stalled(initial, idle + 1, tools.snapshot(), idle + 2)).toBeFalse();
+
+  const visible = { ...initial, visibleText: "fresh response text" };
+  expect(watchdog.stalled(visible, idle + 1, tools.snapshot(), 2 * idle)).toBeFalse();
+  tools.recordToolBatch(1, 2 * idle + 1);
+  expect(watchdog.stalled(visible, idle + 1, tools.snapshot(), 4 * idle)).toBeFalse();
+  tools.recordToolResult(4 * idle);
+  expect(watchdog.stalled(visible, idle + 1, tools.snapshot(), 5 * idle - 1)).toBeFalse();
+  expect(watchdog.stalled(visible, idle + 1, tools.snapshot(), 5 * idle)).toBeTrue();
 });
 
 test("an idle empty response without completion controls cannot keep the turn alive indefinitely", () => {
