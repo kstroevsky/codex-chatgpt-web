@@ -6,6 +6,7 @@ import type { ChatGptMessageLimits } from "./message-limit-recovery";
 import {
   CHATGPT_WEB_BACKEND_MODEL,
   CHATGPT_WEB_PLATFORM_RESERVE_TOKENS,
+  CHATGPT_WEB_PLUS_THINKING_SHELL_OUTPUT_TOKENS,
   isChatGptWebZeroRiskBackendModel,
   resolveChatGptWebContextLimits,
   resolveChatGptWebMultipartContextWindow,
@@ -13,7 +14,7 @@ import {
   supportsChatGptWebBiggerContext,
   supportsChatGptWebBiggerInlineInput,
 } from "../../chatgpt-web-models";
-import type { CodexParsedRequest, CodexUsage } from "../../types";
+import type { CodexParsedRequest, CodexToolResultMessage, CodexUsage } from "../../types";
 import { isNativeCompactionMessage, isReadableCompactionSummaryText } from "../../responses/compaction";
 import { compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens } from "./input-tokens";
 import {
@@ -157,16 +158,30 @@ function roundEvidenceText(evidence: ChatGptWebRoundEvidence): string {
   });
 }
 
+function isBoundedShellTool(request: BrokerToolRequest): boolean {
+  return !request.freeform && ["exec_command", "write_stdin", "functions.exec_command", "functions.write_stdin"]
+    .includes(request.wireName);
+}
+
+export function limitChatGptWebShellOutput(request: BrokerToolRequest): BrokerToolRequest {
+  if (!isBoundedShellTool(request)) return request;
+  const limit = request.arguments?.max_output_tokens;
+  if (limit != null && (typeof limit !== "number" || !Number.isSafeInteger(limit)
+    || limit <= CHATGPT_WEB_PLUS_THINKING_SHELL_OUTPUT_TOKENS)) return request;
+  return {
+    ...request,
+    arguments: { ...request.arguments, max_output_tokens: CHATGPT_WEB_PLUS_THINKING_SHELL_OUTPUT_TOKENS },
+  };
+}
+
 function pendingToolOutputTokens(evidence: ChatGptWebRoundEvidence, fallback: number): number {
   let boundedTokens = 0;
   let hasUnbounded = false;
   for (const request of evidence.toolRequests ?? []) {
     // These outer Codex tools enforce this output budget. Other tools keep the existing
     // one-message headroom; arbitrary similarly named arguments are not a size guarantee.
-    const bounded = ["exec_command", "write_stdin", "functions.exec_command", "functions.write_stdin"]
-      .includes(request.wireName);
     const limit = request.arguments?.max_output_tokens;
-    if (bounded && Number.isSafeInteger(limit) && Number(limit) > 0) boundedTokens += Number(limit);
+    if (isBoundedShellTool(request) && Number.isSafeInteger(limit) && Number(limit) > 0) boundedTokens += Number(limit);
     else hasUnbounded = true;
   }
   // The existing reserve belongs to the round, not to each unbounded call in a batch.
@@ -181,6 +196,7 @@ export function estimateChatGptWebUsage(
   experimentalSkillAttachments = false,
   appName?: string,
   messageLimits?: ChatGptMessageLimits,
+  browserToolResults?: ReadonlyMap<string, CodexToolResultMessage>,
 ): CodexUsage {
   const evidenceText = roundEvidenceText(evidence);
   const outputTokens = conservativeTextTokens(evidenceText, parsed.modelId);
@@ -192,6 +208,7 @@ export function estimateChatGptWebUsage(
     experimentalSkillAttachments,
     experimentalBiggerContext,
     messageLimits,
+    browserToolResults,
   };
   let compiled: CompiledChatGptWebPrompt;
   try {

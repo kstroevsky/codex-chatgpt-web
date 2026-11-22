@@ -1,3 +1,5 @@
+import { seedExecutionReceipts } from "./execution-receipts";
+import { restoreRolloutExecutionReceipts } from "./rollout-execution-receipts";
 import { existsSync, readFileSync, renameSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { atomicWriteFile } from "../../config";
@@ -176,6 +178,28 @@ export class ChatGptThreadEnvironmentStore {
   ) {
     this.codexHomes = getTrustedCodexHomes(codexHome, additionalCodexHomes);
   }
+
+  restoreExecutionReceipts(parsed: CodexParsedRequest): void {
+    seedExecutionReceipts(parsed);
+    const input = record(parsed._rawBody)?.input;
+    // A shallow view has no WeakMap seed: this gate checks raw native carry, not cached recovery.
+    if (!Array.isArray(input) || !input.some(item => record(item)?.type === "compaction")) return;
+    try {
+      const identity = extractChatGptTurnIdentity(parsed);
+      const lineage = extractChatGptThreadSpawnLineage(parsed) ?? extractChatGptRootThreadMetadata(parsed);
+      const compactionSourceTurnId = parsed._compactionRequest ? extractChatGptCompactionSourceRevision(parsed).turnId : undefined;
+      if (!lineage || !identity.turnId || !restoreRolloutExecutionReceipts(parsed, {
+        codexHome: this.codexHomes[0]!, additionalCodexHomes: this.codexHomes.slice(1),
+        ...(this.sqliteHome ? { sqliteHome: this.sqliteHome } : {}),
+        lineage, turnId: identity.turnId,
+        ...(compactionSourceTurnId ? { compactionSourceTurnId } : {}), tools: parsed.context.tools,
+      })) throw new Error("Native receipt history unavailable");
+    } catch {
+      seedExecutionReceipts(parsed);
+      console.warn("[chatgpt-web] execution_receipt_backfill unavailable");
+    }
+  }
+
 
   resolve(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
     const identity = extractChatGptTurnIdentity(parsed);

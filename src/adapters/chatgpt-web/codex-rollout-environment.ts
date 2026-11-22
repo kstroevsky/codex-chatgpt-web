@@ -172,6 +172,28 @@ function scanCanonicalRollouts(codexHome: string, threadId: string): string[] {
   return matches;
 }
 
+/** Resolve only an explicit native history_base edge within the authenticated owning thread. */
+export function resolveCodexRolloutAncestor(
+  currentPath: string,
+  homes: readonly string[],
+  lineage: RolloutIdentity,
+  segmentId: string,
+): string {
+  if (!CODEX_ID.test(segmentId)) throw new Error("Invalid native history segment");
+  const owners = homes.filter(home => existsSync(join(home, "sessions"))
+    && contains(realpathSync(join(home, "sessions")), currentPath));
+  if (owners.length !== 1) throw new Error("Ambiguous native history owner");
+  const suffix = segmentId === lineage.threadId ? `-${lineage.threadId}.jsonl` : `-${lineage.threadId}_${segmentId}.jsonl`;
+  const candidates = scanCanonicalRollouts(owners[0]!, lineage.threadId).filter(path => basename(path).endsWith(suffix));
+  if (candidates.length !== 1) throw new Error("Native history ancestor unavailable");
+  const path = validateRolloutPath(owners[0]!, candidates[0]!, lineage.threadId);
+  const fd = openSync(path, "r");
+  try { validateSessionMeta(firstRolloutRecord(fd, fstatSync(fd).size), lineage); }
+  finally { closeSync(fd); }
+  return path;
+}
+
+
 function parseJsonLine(line: Buffer): Record<string, unknown> {
   try {
     const parsed = JSON.parse(line.toString("utf8").replace(/^\uFEFF/, ""));

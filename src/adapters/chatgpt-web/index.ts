@@ -1,6 +1,8 @@
+import { hasCanonicalExecutionEvidence, readCompactionExecutionReceipts } from "./execution-receipts";
+import { ChatGptReadOutputReuse } from "./read-output-reuse";
 import { createHash, randomBytes } from "node:crypto";
 import { resolve } from "node:path";
-import { isChatGptWebZeroRiskBackendModel, supportsChatGptWebBiggerContext } from "../../chatgpt-web-models";
+import { isChatGptWebZeroRiskBackendModel, supportsChatGptWebBiggerContext, supportsChatGptWebBiggerInlineInput } from "../../chatgpt-web-models";
 import { ChatGptMessageLimitStore, runWithMessageLimitRecovery } from "./message-limit-recovery";
 import { defaultBrokerEndpoint, expandUserPath, resolveBrokerEndpoint } from "../../config";
 import {
@@ -30,7 +32,7 @@ import { createChatGptStructuredOutputValidator } from "./output-validation";
 import { chatGptWebTurnRetryPolicy } from "./retry-policy";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult, type TurnBrokerOwner } from "./turn-broker";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
-import { compileBiggerContextPrompt, compileFreshChatGptWebPrompt, estimateChatGptWebUsage } from "./usage";
+import { compileBiggerContextPrompt, compileFreshChatGptWebPrompt, estimateChatGptWebUsage, limitChatGptWebShellOutput } from "./usage";
 import { ChatGptThreadEnvironmentStore } from "./thread-environment";
 import {
   ChatGptLunaCheckpointStore,
@@ -820,6 +822,7 @@ export function createChatGptWebAdapter(
     if (!environment) throw new Error("Tool-capable ChatGPT web mode requires a trusted Codex environment");
     const token = deferred<string>();
     const externalProgress = new ChatGptExternalTurnProgress();
+    const readOutputReuse = experimentalBiggerContext ? new ChatGptReadOutputReuse(readCompactionExecutionReceipts(parsed)) : undefined;
     let tokenSettled = false;
     let activeToken: string | undefined;
     const prepareWith = async (input: CodexParsedRequest, transactionId?: string) => {
@@ -884,6 +887,7 @@ export function createChatGptWebAdapter(
       browserTraceIds,
       token: token.promise,
       externalProgress,
+      ...(readOutputReuse ? { readOutputReuse } : {}),
       browser: browserTurn.browser,
       physicalSettlement: browserTurn.physicalSettlement,
       trace,
@@ -970,6 +974,7 @@ export function createChatGptWebAdapter(
         if (mode.localTools) {
           try {
             environment = environmentStore.resolve(parsed);
+            environmentStore.restoreExecutionReceipts(parsed);
           } catch (error) {
             const identity = extractChatGptTurnIdentity(parsed);
             console.warn(
@@ -1144,6 +1149,13 @@ export function createChatGptWebAdapter(
                     if (!source || !retainedKey) {
                       return await runFreshCompaction("source_unavailable_before_handoff");
                     }
+                    const canonicalCheckpoint = async (): Promise<string> => {
+                      stopSourceProgress?.();
+                      await (preserveFinalResponse
+                        ? chatGptTurnSessions.retireConversationPreservingFinalResponse(retainedKey, source!, compactedSourceExecutionKey)
+                        : chatGptTurnSessions.retireConversationAndWait(retainedKey));
+                      return await runFreshCompaction("canonical_execution_history");
+                    };
                     // Renew only for observed source activity, never an idle helper heartbeat.
                     stopSourceProgress = source.runtime.trace.observeProgress(() => armHandoffDeadline("source_activity"));
                     let rawSummary: string;
@@ -1181,6 +1193,7 @@ export function createChatGptWebAdapter(
                       stopSourceProgress?.();
                       handoffPhase = "retained_checkpoint";
                       armHandoffDeadline();
+                      if (hasCanonicalExecutionEvidence(parsed)) return await canonicalCheckpoint();
                       rawSummary = await requestRetainedCompactionHandoff(
                         worker,
                         parsed,
@@ -1201,6 +1214,7 @@ export function createChatGptWebAdapter(
                       stopSourceProgress?.();
                       handoffPhase = "retained_checkpoint";
                       armHandoffDeadline();
+                      if (hasCanonicalExecutionEvidence(parsed)) return await canonicalCheckpoint();
                       rawSummary = await requestRetainedCompactionHandoff(
                         worker,
                         parsed,
@@ -1321,6 +1335,7 @@ export function createChatGptWebAdapter(
           chatGptInstructionLineage(parsed),
         );
         const roundKey = chatGptTurnRoundKey(parsed);
+        const readReuse = session.runtime.mode === "tools" ? session.runtime.readOutputReuse : undefined;
         const emitRoundEvents = (events: readonly AdapterEvent[]): void => {
           // Journal the complete synchronous event batch before touching the HTTP observer. If the
           // observer disconnects midway through emission, an exact reconnect can replay the entire
@@ -1385,7 +1400,7 @@ export function createChatGptWebAdapter(
               session.setFinalEvents(session.roundEvents(roundKey));
               emitRoundBatch(buffer => emitBrowserCompletion(
                 settled,
-                estimateChatGptWebUsage(currentUsageInput(parsed), { answer: settled.answer, reasoning }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments, provider.chatgptWeb?.appName, usageLimits(parsed, turnCapabilities)),
+                estimateChatGptWebUsage(currentUsageInput(parsed), { answer: settled.answer, reasoning }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments, provider.chatgptWeb?.appName, usageLimits(parsed, turnCapabilities), readReuse?.overrides),
                 buffer,
               ));
               session.completeRound(roundKey);
@@ -1407,7 +1422,7 @@ export function createChatGptWebAdapter(
                   if (replay.length === 0) emitRoundEvents(session.eventsForOutstandingReplay());
                   emitRoundBatch(buffer => emitToolBatch(
                     outstanding,
-                    estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning, toolRequests: outstanding }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments, provider.chatgptWeb?.appName, usageLimits(parsed, turnCapabilities)),
+                    estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning, toolRequests: outstanding }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments, provider.chatgptWeb?.appName, usageLimits(parsed, turnCapabilities), readReuse?.overrides),
                     buffer,
                   ));
                   session.completeRound(roundKey);
@@ -1416,11 +1431,23 @@ export function createChatGptWebAdapter(
                 if (results.length !== outstanding.length) {
                   throw new Error(`Codex returned ${results.length} of ${outstanding.length} results for a parallel ChatGPT tool batch`);
                 }
+                const delivered = [];
                 for (const message of results) {
-                  await broker.completeTool(turnToken, message.toolCallId, brokerResult(message));
+                  const request = outstanding.find(item => item.callId === message.toolCallId);
+                  const projected = readReuse?.prepare(message, request);
+                  const visible = projected?.message ?? message;
+                  const deliveredResult = brokerResult(visible);
+                  await broker.completeTool(turnToken, message.toolCallId, deliveredResult);
+                  if (projected) delivered.push(projected);
                   session.runtime.externalProgress.recordToolResult();
                   session.runtime.trace.recordProgress();
                   session.markResultDelivered(message.toolCallId);
+                }
+                // Later rounds may reference earlier visible results. A parallel batch cannot
+                // refer to another output in its own batch before the model receives it.
+                for (const item of delivered) {
+                  item.commit();
+                  if (item.kind) console.info(`[chatgpt-web] exact_read_reuse ${JSON.stringify({ traceId, kind: item.kind })}`);
                 }
               }
             } else if (session.outstanding().length > 0) {
@@ -1493,7 +1520,7 @@ export function createChatGptWebAdapter(
                 }
                 emitRoundBatch(buffer => emitBrowserCompletion(
                   completedOutcome,
-                  estimateChatGptWebUsage(currentUsageInput(parsed), { answer: completedOutcome.answer, reasoning: roundReasoning }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments, provider.chatgptWeb?.appName, usageLimits(parsed, turnCapabilities)),
+                  estimateChatGptWebUsage(currentUsageInput(parsed), { answer: completedOutcome.answer, reasoning: roundReasoning }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments, provider.chatgptWeb?.appName, usageLimits(parsed, turnCapabilities), readReuse?.overrides),
                   buffer,
                 ));
                 session.completeRound(roundKey);
@@ -1550,10 +1577,15 @@ export function createChatGptWebAdapter(
                   return;
                 }
                 validateBatchTools(parsed, next.requests);
-                session.setOutstanding(next.requests, roundReasoning, session.roundEvents(roundKey));
+                // Keep the delivered arguments, retry journal and usage forecast on the same budget.
+                const boundShellOutput = experimentalBiggerContext && !session.runtime.manualControl
+                  && supportsChatGptWebBiggerInlineInput(parsed.modelId,
+                    resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities).effort, turnCapabilities);
+                const requests = boundShellOutput ? next.requests.map(limitChatGptWebShellOutput) : next.requests;
+                session.setOutstanding(requests, roundReasoning, session.roundEvents(roundKey));
                 emitRoundBatch(buffer => emitToolBatch(
-                  next.requests,
-                  estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning: roundReasoning, toolRequests: next.requests }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments, provider.chatgptWeb?.appName, usageLimits(parsed, turnCapabilities)),
+                  requests,
+                  estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning: roundReasoning, toolRequests: requests }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments, provider.chatgptWeb?.appName, usageLimits(parsed, turnCapabilities), readReuse?.overrides),
                   buffer,
                 ));
                 session.completeRound(roundKey);

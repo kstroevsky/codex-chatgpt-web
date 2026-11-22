@@ -1,3 +1,4 @@
+import { augmentCompactionWithExecutionReceipts } from "./execution-receipts";
 import { parseDataUrl } from "../image";
 import type {
   CodexContentPart,
@@ -17,7 +18,8 @@ import {
 import type { BrokerToolResult, TurnBroker, TurnBrokerOwner } from "./turn-broker";
 import type { ChatGptTurnSession } from "./turn-execution";
 
-export const LATEST_USER_PROMPT_MARKER = "CODEX_LATEST_USER_PROMPT_JSON";
+import { LATEST_USER_PROMPT_MARKER } from "../../responses/compaction";
+export { LATEST_USER_PROMPT_MARKER } from "../../responses/compaction";
 
 function brokerContent(content: string | CodexContentPart[]): unknown[] {
   if (typeof content === "string") return [{ type: "text", text: content }];
@@ -106,11 +108,11 @@ export function canonicalizeCompactionHandoff(
   }
   const appendix = `${LATEST_USER_PROMPT_MARKER}\n${JSON.stringify(latestUserPrompt)}`;
   const markerOffset = normalized.lastIndexOf(`\n${LATEST_USER_PROMPT_MARKER}\n`);
-  if (markerOffset < 0) return `${normalized}\n\n${appendix}`;
+  if (markerOffset < 0) return `${augmentCompactionWithExecutionReceipts(parsed, normalized)}\n\n${appendix}`;
   if (normalized.slice(markerOffset + 1).trimEnd() !== appendix) {
     throw new Error("ChatGPT compaction handoff contains a conflicting latest-user marker");
   }
-  return normalized;
+  return `${augmentCompactionWithExecutionReceipts(parsed, normalized.slice(0, markerOffset).trimEnd())}\n\n${appendix}`;
 }
 
 function currentToolResults(

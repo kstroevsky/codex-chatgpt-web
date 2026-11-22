@@ -3,6 +3,7 @@ import type { CompactionTransactionHandle } from "./compaction-transaction";
 
 export const CODEX_COMPACTION_CONTROL_WIRE_NAME = "codex.control.compaction_handoff";
 export const CODEX_ACTIVE_COMPACTION_REQUEST_MARKER = "CODEX_ACTIVE_COMPACTION_REQUEST";
+export const COMPACTION_READ_HANDOFF = "Record the findings needed for the next step from files and chats already read. Include exact file paths and relevant ranges or symbols, and identify any chat snapshots used. Mark known changes and missing evidence so the next model can reuse valid findings and target only the missing detail.";
 
 function compactionControlBinding(transaction: CompactionTransactionHandle, appName: string): string[] {
   return [
@@ -70,6 +71,7 @@ export function structuredCompactionHandoffInstruction(
   return [
     "Automatic Codex context compaction has started. Stop ordinary task work and do not call any more work tools.",
     COMPACT_PROMPT,
+    COMPACTION_READ_HANDOFF,
     ...compactionControlBinding(transaction, appName),
     "After the control call returns submitted=true, call no more tools. The bridge will close this one-purpose Web response after accepting the checkpoint.",
     "If the call is rejected or fails, stop and report its actual error. Do not retry through another tool or claim the summary was submitted without submitted=true.",
